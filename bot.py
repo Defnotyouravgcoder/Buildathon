@@ -37,7 +37,7 @@ STYLE = "hunt"
 #   "fight": v5 + duck behind walls from charging lasers, rush laser users up close, third-party, heal breaks
 VARIANT = "combo"
 # v10 = v9-fight (4.04) + v9-max aggression (3.88), without farming (v9-farm 2.89 hurt)
-HEAL_BREAKS = True        # v10a
+HEAL_BREAKS = False        # v10b
 NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
