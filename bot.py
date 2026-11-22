@@ -36,12 +36,11 @@ STYLE = "hunt"
 #   "farm" : v5 + much more drones / crates / cubes / supply drops (cubes = +4% HP & dmg + upgrades)
 #   "fight": v5 + duck behind walls from charging lasers, rush laser users up close, third-party, heal breaks
 VARIANT = "fight"
-# ---- v15 ----
-MIN_HIT_P = 0.50         # gun: only fire when the estimated hit chance is at least this (moving target: ~185 m)
-CHASE_ENERGY = 40.0      # never sprint-chase below this (energy also = jumps, jets, zone escape)
-STRAFE_SWITCH = (0.25, 0.6)   # s between strafe direction flips (was 0.6-1.6)
-NAV_CACHE = "nav_cache.bin"   # precomputed by precompute_nav.py (the map never changes)
-NEST_CACHE = "nests.json"
+# ---- v16 ----
+DUEL_CLOSE = 30.0        # duel distance for everyone: inside lightning range, gun hits most shots
+CLOSE_BOOST_E = 40.0     # boost to close only with this much energy (keep some for jumps / zone)
+DROP_RANGE = 220.0       # consider every supply drop (all three) within this distance
+AMBUSH_R = (20.0, 45.0)  # ambush spot: this far from the landing point, with a view of it
 NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
@@ -128,7 +127,7 @@ class World:
     CELL = 40.0
     NAV = 4.0
 
-    def __init__(self, map_dir, seed, budget_s=12.0, use_cache=True):
+    def __init__(self, map_dir, seed, budget_s=5.0):
         t0 = time.perf_counter()
         self.deadline = t0 + budget_s
         self.prisms, self.grid = [], {}
@@ -142,11 +141,8 @@ class World:
                 w = json.load(f)
             self._load_prisms(w)
             self._load_terrain(map_dir, w)
-            here = os.path.dirname(os.path.abspath(__file__))
-            if not (use_cache and self._load_nav_cache(os.path.join(here, NAV_CACHE))):
-                self._build_nav()
-            if not (use_cache and self._load_nest_cache(os.path.join(here, NEST_CACHE))):
-                self._build_nests(random.Random(seed))
+            self._build_nav()
+            self._build_nests(random.Random(seed))
         except Exception as e:
             mf.log("world init problem:", repr(e))
         mf.log(f"world: prisms={len(self.prisms)} nav={'y' if self.nav else 'n'} nests={len(self.nests)} {time.perf_counter()-t0:.2f}s")
@@ -219,30 +215,6 @@ class World:
         return self.hit(x, y, z + 1.2, z + 9.0)
 
     # ----- navigation grid -----
-    def _load_nav_cache(self, path):
-        try:
-            with open(path, "rb") as f:
-                raw = f.read()
-            w = int.from_bytes(raw[0:4], "little")
-            h = int.from_bytes(raw[4:8], "little")
-            exp_w, exp_h = int(self.nx * self.step / self.NAV), int(self.ny * self.step / self.NAV)
-            if (w, h) != (exp_w, exp_h) or len(raw) != 8 + w * h:
-                mf.log("nav cache does not match this map; rebuilding")
-                return False
-            self.navw, self.navh, self.nav = w, h, bytearray(raw[8:])
-            return True
-        except Exception as e:
-            mf.log("no nav cache:", repr(e))
-            return False
-
-    def _load_nest_cache(self, path):
-        try:
-            with open(path) as f:
-                self.nests = [tuple(n) for n in json.load(f)]
-            return bool(self.nests)
-        except Exception:
-            return False
-
     def _build_nav(self):
         if self.terr is None:
             return
@@ -253,11 +225,7 @@ class World:
         offs = ((0, 0), (1.5, 1.5), (-1.5, 1.5), (1.5, -1.5), (-1.5, -1.5))
         for cy in range(self.navh):
             if time.perf_counter() > self.deadline:
-                # a half-built grid would mark unbuilt rows as free -> A* through buildings.
-                # better no planner at all (steer-only) than a wrong one.
-                mf.log("nav build ran out of time at row", cy, "of", self.navh, "- planner disabled")
-                self.nav = None
-                return
+                break
             for cx in range(self.navw):
                 x = self.minx + (cx + 0.5) * cs
                 y = self.miny + (cy + 0.5) * cs
@@ -309,7 +277,7 @@ class World:
                     edges.append((ring, ax, ay, bx, by))
         rnd.shuffle(edges)
         dirs = [(math.cos(TAU * k / 16), math.sin(TAU * k / 16)) for k in range(16)]
-        for ring, ax, ay, bx, by in (edges if getattr(self, "all_edges", False) else edges[:600]):
+        for ring, ax, ay, bx, by in edges[:600]:
             if time.perf_counter() > self.deadline:
                 break
             mx, my = (ax + bx) / 2, (ay + by) / 2
@@ -403,7 +371,7 @@ class Planner:
 
 
 class Bot:
-    name = "survivor-v15"
+    name = "survivor-v16"
 
     def __init__(self, hello):
         seed = int(hello.get("seed", 0)) ^ (int(hello.get("slot", 0)) * 7919)
@@ -438,8 +406,6 @@ class Bot:
             ty = ev.get("type")
             if ty == "take_failed":
                 self.bad.add(ev["id"])
-            elif ty == "kill":
-                self.kill_t = t
             elif ty == "damaged":
                 self.last_dmg = t
                 if ev.get("weapon") == "laser":
@@ -567,6 +533,24 @@ class Bot:
                 return best
         return None
 
+    def pick_ambush(self, x, y, px, py, pz):
+        """Wall-side spot AMBUSH_R from the drop with a clear view of the ring centre; nearest to us."""
+        best, bs = None, 1e18
+        for nx_, ny_, ex in self.world.nests:
+            d = math.hypot(nx_ - px, ny_ - py)
+            if not (AMBUSH_R[0] <= d <= AMBUSH_R[1]):
+                continue
+            g = self.world.ground(nx_, ny_)
+            if not self.world.los((nx_, ny_, g + 8.0), (px, py, pz + 4.5)):
+                continue
+            sc = math.hypot(nx_ - x, ny_ - y) + 60.0 * ex        # prefer close to us and low exposure
+            if sc < bs:
+                best, bs = (nx_, ny_), sc
+        if best is None:                                       # no wall spot: 35 m out on our side
+            dx, dy = norm2(x - px, y - py)
+            best = (px + dx * 35.0, py + dy * 35.0)
+        return best
+
     def pick_nest(self, x, y, rc, rr):
         best, bs = None, 1e18
         for px, py, ex in self.world.nests:
@@ -687,8 +671,6 @@ class Bot:
             turn = abs(wrap(math.atan2(tp[1] - y, tp[0] - x) - cur[0]))
             chg = bool(m.get("charging")) and f_err < math.atan2(6.0, max(d, 10.0))
             sc = T.score(d, m.get("hp"), m.get("weapons") or ["gun"], f_err, turn, clear, chg)
-            if f_err > math.pi / 2:
-                sc -= 0.12          # its back is to us: rear hits do x1.5
             ranked.append((sc, d, m, clear, ch))
         ranked.sort(key=lambda r: r[0])
         clear_close = [r for r in ranked if r[3] and r[1] < (220 if VARIANT == "max" else 150)]
@@ -715,7 +697,7 @@ class Bot:
 
         if t >= self.side_until:
             self.side = self.rng.choice((-1, 1))
-            self.side_until = t + self.rng.uniform(*STRAFE_SWITCH)
+            self.side_until = t + self.rng.uniform(0.6, 1.6)
 
         # ---- laser rush: the built-in bots win with lasers, so get one first ----
         rush = None
@@ -781,13 +763,8 @@ class Bot:
                     sp_ = 20.0
                     boost = me["energy"] > 30
                 else:
-                    sp_ = 140.0 if li is not None else DUEL_DIST
-                ehp = (m.get("hp") or 1400) / max(m.get("max_hp") or 1400, 1)
-                facing_away = abs(wrap(m["aim"][0] - math.atan2(y - tp[1], x - tp[0]))) > math.pi / 2
-                if me["energy"] >= CHASE_ENERGY and ehp < 0.4 and rate > 1.0:
-                    sp_, boost, mode = 15.0, True, "chase-weak"      # it is fleeing hurt: run it down
-                elif me["energy"] >= CHASE_ENERGY and facing_away and d > 60:
-                    sp_, boost, mode = min(sp_, 60.0), True, "flank"  # its back is to us: close in for x1.5 hits
+                    sp_ = DUEL_CLOSE                       # v16: close in (was 140 m with a laser / 70 m without)
+                    boost = d > 50 and me["energy"] > CLOSE_BOOST_E
                 mv = self.radial_strafe(d, rate, bearing, sp_)
             if not me["in_zone"]:
                 bx, by = self.steer(x, y, z, rp[0], rp[1])
@@ -802,12 +779,6 @@ class Bot:
             mode, urgent = "chase", True
             mv = self.go_to(x, y, z, goal, tick, deadline)
             boost = me["energy"] > 40
-        elif (hidden_vis and me["energy"] >= CHASE_ENERGY and inside and not self.healing
-              and (hidden_vis[0][2].get("hp") or 1400) / max(hidden_vis[0][2].get("max_hp") or 1400, 1) < 0.4
-              and hidden_vis[0][1] < 120):
-            tp = hidden_vis[0][2]["pos"]
-            mode, goal, urgent, boost = "chase-weak", (tp[0], tp[1]), True, True
-            mv = self.go_to(x, y, z, goal, tick, deadline)
         elif hidden_vis or recent_dmg:
             mode = "wary"
             self.cover = None
@@ -821,14 +792,14 @@ class Bot:
             self.cover = None
             mode, goal, mv, farm = self.peaceful(obs, me, x, y, z, rc, rr, inside, rp, npcs, hpr, weapons, slot_of,
                                                  t, tick, deadline, act, muzzle)
-            if mode in ("zone", "drop"):
-                urgent = urgent or mode == "zone"
+            if mode in ("zone", "drop", "ambush-go"):
+                urgent = True
             if VARIANT == "max" and mode in ("hunt", "farmgo", "cubes", "loot", "nest"):
                 urgent = True
                 boost = me["energy"] > 50 and mode == "hunt"
 
         # ---------- apply movement ----------
-        if mode in ("hold", "crate", "heal", "take") or (mv[0] == 0 and mv[1] == 0):
+        if mode in ("hold", "crate", "heal", "take", "ambush", "drop-hold") or (mv[0] == 0 and mv[1] == 0):
             move = [0.0, 0.0]
         else:
             sc_move = 1.0 if urgent else (0.75 if mode == "drop" else NOISE_FREE)
@@ -838,7 +809,7 @@ class Bot:
             act["boost"] = True
 
         spd = math.hypot(me["vel"][0], me["vel"][1])
-        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt", "chase", "farmgo", "chase-weak") and (move[0] or move[1]) and spd < 1.5:
+        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt", "chase", "farmgo", "ambush-go") and (move[0] or move[1]) and spd < 1.5:
             self.stuck += 1
         else:
             self.stuck = max(0, self.stuck - 2) if self.stuck < 20 else 0
@@ -903,13 +874,9 @@ class Bot:
             act["aim"] = [aim[0], aim[1]]
         if fire[0] or fire[1]:
             act["fire"] = fire
-        elif gi is not None and target is None:
-            # nobody in a clean line of fire right now (it died, or ducked behind cover): reload now,
-            # not in the middle of the next fight
+        elif gi is not None and not threat_pos:
             gs = weapons[gi]
-            mag = gs["stats"].get("mag", 12)
-            just_killed = t - getattr(self, "kill_t", -99.0) < 2.0
-            if gs.get("reload", 0) <= 0 and (gs.get("ammo", 99) < mag * 0.6 or (just_killed and gs.get("ammo", 99) < mag * 0.85)):
+            if gs.get("ammo", 99) < gs["stats"].get("mag", 12) * 0.6 and gs.get("reload", 0) <= 0:
                 act["reload"] = True
 
         # ---------- debug ----------
@@ -961,22 +928,40 @@ class Bot:
                     act["drop"] = slot_of[cur_other]
             elif hd < 40 and math.hypot(p["pos"][0] - rc[0], p["pos"][1] - rc[1]) < rr:
                 return "loot", p["pos"], self.go_to(x, y, z, p["pos"], tick, deadline), None
-        # 2) supply drop close to me and nobody near it
-        drop_ok = (t < 200 and hpr > 0.5) if VARIANT != "farm" else (hpr < 0.8 or me["cubes"] < 6)
-        drop_rng = 200 if VARIANT == "farm" else 130
-        if drop_ok:
-            for dp in obs.get("drops", []):
-                px, py = dp["pos"][0], dp["pos"][1]
-                dd = math.hypot(px - x, py - y)
-                if dd > drop_rng or math.hypot(px - rc[0], py - rc[1]) > rr:
-                    continue
-                if any(math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 40 for m in obs["mechs"] if m["kind"] == "mech"):
-                    continue
-                if dd < dp["radius"] * 0.5 and dp["lands_in"] <= 0:
-                    return "hold", (px, py), (0.0, 0.0), None
-                if dd / (11.7 * 0.75) > dp["lands_in"] + 8:
-                    continue
+        # 2) v16 supply-drop ambush: drops are announced 25 s early and everyone converges.
+        #    falling -> wait at a wall-side spot 20-45 m away with a view of the ring, kill arrivals;
+        #    landed and quiet for 2 s -> step into the ring and capture (3 cubes, full HP and energy).
+        best_dp = None
+        for dp in obs.get("drops", []):
+            px, py = dp["pos"][0], dp["pos"][1]
+            dd = math.hypot(px - x, py - y)
+            if dd > DROP_RANGE or math.hypot(px - rc[0], py - rc[1]) > rr - 3:
+                continue
+            if dp.get("holder") not in (None, me["id"]) and dp["lands_in"] <= 0 and dp.get("progress", 0) > 2.5:
+                continue                                  # someone else is almost done: not worth it
+            if best_dp is None or dd < best_dp[1]:
+                best_dp = (dp, dd)
+        if best_dp is not None and hpr > 0.3:
+            dp, dd = best_dp
+            px, py, pz = dp["pos"]
+            near = [m for m in obs["mechs"] if m["kind"] == "mech" and math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 35]
+            if near:
+                self.drop_busy_t = t
+            quiet = t - getattr(self, "drop_busy_t", -99.0) > 2.0
+            in_ring = dd < dp["radius"] * 0.6
+            if dp["lands_in"] <= 0 and quiet:
+                if in_ring:
+                    return "drop-hold", (px, py), (0.0, 0.0), None
                 return "drop", (px, py), self.go_to(x, y, z, (px, py), tick, deadline), None
+            # ambush spot (cached per drop)
+            key = dp["id"]
+            if getattr(self, "ambush_key", None) != key:
+                self.ambush_key, self.ambush_pt = key, self.pick_ambush(x, y, px, py, pz)
+            ap = self.ambush_pt
+            if ap is not None:
+                if math.hypot(ap[0] - x, ap[1] - y) > 3:
+                    return "ambush-go", ap, self.go_to(x, y, z, ap, tick, deadline), None
+                return "ambush", ap, (0.0, 0.0), None
         # 3) cubes
         if me["cubes"] < CUBE_CAP:
             cs = [c for c in obs.get("cubes", []) if math.dist(c["pos"][:2], (x, y)) < (70 if VARIANT in ("farm", "max") else 40)
@@ -1039,25 +1024,13 @@ class Bot:
             return "nest", self.nest, self.go_to(x, y, z, self.nest, tick, deadline), None
         return "hold", self.nest, (0.0, 0.0), None
 
-    @staticmethod
-    def gun_hit_p(muzzle, tc, vel, d, speed, spread_deg, radius=2.5):
-        """Rough chance a led bullet hits: spread + how far the target can juke during the flight."""
-        tf = d / speed
-        bx, by = tc[0] - muzzle[0], tc[1] - muzzle[1]
-        n = math.hypot(bx, by) or 1.0
-        v_perp = abs(-vel[0] * by / n + vel[1] * bx / n)
-        # calibrated on lead_test.py (targets changing direction every ~0.7 s): ~99% at 80 m,
-        # ~64% at 150 m, ~40% at 220 m for a walking target; spread alone for a standing one
-        juke = 0.25 * min(0.5 * 58.5 * tf * tf, 2.0 * v_perp * tf)
-        sig = math.hypot(d * math.tan(math.radians(spread_deg)), juke)
-        return clampf(math.erf((radius + 0.3) / (sig * 1.4142 + 1e-9)), 0.0, 0.99)
-
     def shoot(self, me, weapons, gi, li, ni, mi, muzzle, cur, tc, vel, acc, d, clear, tick, gun_range):
         """Choose weapon + aim for target centre tc. Returns (aim, fire[2])."""
         fire = [False, False]
         aim = None
         # laser: charge fully, let go only when lined up; never let the server auto-fire it
-        if li is not None:
+        # v16: inside lightning range, lightning (240 dps, shorts their laser) beats starting a new charge
+        if li is not None and not (ni is not None and d <= 42 and weapons[li].get("charge", 0.0) <= 0):
             lw = weapons[li]
             charge = lw.get("charge", 0.0)
             full = lw["stats"].get("charge", 0.75)
@@ -1097,12 +1070,8 @@ class Bot:
             aim = lead_aim(muzzle, tc, vel, acc, gs["stats"].get("speed", 252.0))
             thr = clampf(math.atan2(3.0, d), 0.02, 0.15)
             err = max(abs(wrap(aim[0] - cur[0])), abs(aim[1] - cur[1]))
-            rng = gs["stats"].get("range", 230.0)
-            p_hit = self.gun_hit_p(muzzle, tc, vel, d, gs["stats"].get("speed", 252.0), gs["stats"].get("spread_deg", 0.6))
-            if gun_range < 100:
-                rng = min(rng, gun_range)           # farming: keep the old short range
-            need_p = MIN_HIT_P if gs.get("ammo", 12) > 4 else 0.75    # keep the last rounds for good shots
-            if clear and err < thr and d <= rng and p_hit >= need_p and gs.get("ammo", 1) > 0 and gs.get("reload", 0) <= 0:
+            rng = min(gs["stats"].get("range", 230.0), gun_range)
+            if clear and err < thr and d <= rng and gs.get("ammo", 1) > 0 and gs.get("reload", 0) <= 0:
                 fire[gi] = True
         if ni is not None and d <= 42 and me["energy"] >= 5 and not fire[ni]:
             if abs(wrap(direct_aim(muzzle, tc)[0] - cur[0])) < 0.2:
