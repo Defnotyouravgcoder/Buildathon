@@ -9,7 +9,7 @@ import math
 TAU = 2 * math.pi
 
 # tuned offline with tune_weights.py (see its docstring for what the oracle assumes)
-WEIGHTS = {"dist": 0.30, "hp": 0.35, "threat": 0.25, "opp": 0.10}   # v12: a bit more weight on who can hurt us
+WEIGHTS = {"dist": 0.35, "hp": 0.40, "threat": 0.15, "opp": 0.10}
 NO_LOS_PENALTY = 2.0
 
 # rough per-weapon danger to *me* when it is in range (0..1 scale)
