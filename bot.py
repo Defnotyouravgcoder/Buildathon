@@ -30,7 +30,7 @@ CUBE_CAP = 10
 # ---- ONE switch per experiment branch ----
 #   "hide": never take long walks early; hiding spot must be within NEST_RANGE; quiet laser grabs only
 #   "hunt": play like the built-in bots: grab a laser, then go find fights; retreat only when nearly dead
-STYLE = "hunt"
+STYLE = "hide"
 NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
