@@ -27,6 +27,11 @@ RETREAT_DIST = 120.0
 SOFT_BUDGET = 0.030      # seconds of compute per decision we allow ourselves
 PLAN_BUDGET = 0.010
 CUBE_CAP = 10
+# ---- ONE switch per experiment branch ----
+#   "hide": never take long walks early; hiding spot must be within NEST_RANGE; quiet laser grabs only
+#   "hunt": play like the built-in bots: grab a laser, then go find fights; retreat only when nearly dead
+STYLE = "hide"
+NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
 RUSH_UNTIL = 90.0        # early game: go get a laser
@@ -524,7 +529,7 @@ class Bot:
             if math.hypot(px - rc[0], py - rc[1]) > rr - 3:
                 continue
             d = math.hypot(px - x, py - y)
-            if d > 400:
+            if d > NEST_RANGE:
                 continue
             s = d + 250.0 * ex
             if s < bs:
@@ -595,7 +600,7 @@ class Bot:
         slot_of = {w["kind"]: i for i, w in enumerate(weapons) if w}
         gi, li, ni, mi = slot_of.get("gun"), slot_of.get("laser"), slot_of.get("lightning"), slot_of.get("mortar")
         hpr = me["hp"] / max(me["max_hp"], 1.0)
-        if hpr < 0.35:
+        if hpr < (0.35 if STYLE == "hide" else 0.25):
             self.healing = True
         elif hpr >= 0.75:
             self.healing = False
@@ -655,7 +660,8 @@ class Bot:
             if lasers:
                 p_ = min(lasers, key=lambda p: math.dist(p["pos"][:2], (x, y)))
                 dp_ = math.dist(p_["pos"][:2], (x, y))
-                if dp_ < 200 and (not clear_close or dp_ < 30) and (me["in_zone"] or dp_ < 40):
+                max_rush = 60.0 if (STYLE == "hide" and t < 75) else 200.0
+                if dp_ < max_rush and (not clear_close or dp_ < 30) and (me["in_zone"] or dp_ < 40):
                     rush = (p_, dp_)
         outgunned = li is None and (any("laser" in (r[2].get("weapons") or []) for r in clear_close)
                                     or t - self.laser_threat_t < 2.5)
@@ -670,7 +676,8 @@ class Bot:
                 mode, goal = "rush", p_["pos"]
                 mv = self.go_to(x, y, z, p_["pos"], tick, deadline)
                 urgent = True
-                boost = dp_ > 25 and me["energy"] > 35 and not clear_close
+                boost = STYLE == "hunt" and dp_ > 25 and me["energy"] > 35 and not clear_close
+                urgent = STYLE == "hunt" or bool(clear_close)
         elif dg:
             mode, mv, urgent, boost = "dodge", dg, True, dg_boost
         elif clear_close:
@@ -679,8 +686,8 @@ class Bot:
             bearing = math.atan2(tp[1] - y, tp[0] - x)
             tr = self.tracks.get(m["id"], {})
             rate = tr.get("rate", 0.0)
-            weak = hpr < 0.6
-            group = len(clear_close) >= 2
+            weak = hpr < (0.6 if STYLE == "hide" else 0.3)
+            group = len(clear_close) >= (2 if STYLE == "hide" else 3)
             urgent = True
             if group or self.healing or weak or outgunned:
                 mode = "retreat"
@@ -728,7 +735,7 @@ class Bot:
             act["boost"] = True
 
         spd = math.hypot(me["vel"][0], me["vel"][1])
-        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush") and (move[0] or move[1]) and spd < 1.5:
+        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt") and (move[0] or move[1]) and spd < 1.5:
             self.stuck += 1
         else:
             self.stuck = max(0, self.stuck - 2) if self.stuck < 20 else 0
@@ -785,7 +792,7 @@ class Bot:
                     aim = (math.atan2(tp[1] - y, tp[0] - x), 0.0)
                 elif self.tb and t - self.tb[1] < 4.0:
                     aim = (self.tb[0], 0.0)
-                elif (move[0] or move[1]) and mode in ("zone", "loot", "nest", "cubes", "drop"):
+                elif (move[0] or move[1]) and mode in ("zone", "loot", "nest", "cubes", "drop", "hunt", "rush"):
                     aim = (math.atan2(move[1], move[0]), 0.0)
                 else:
                     aim = (wrap(tick * 0.12), 0.0)
@@ -882,6 +889,20 @@ class Bot:
                 if cr:
                     d, c = min(cr, key=lambda a: a[0])
                     return "crate", None, (0.0, 0.0), ("crate", c["pos"], [0, 0, 0], 1.5, d)
+        # 6h) hunt style: walk toward the most recent enemy sighting or loud sound, else toward the centre
+        if STYLE == "hunt":
+            tgt = None
+            recent = [tr for i_, tr in self.tracks.items() if i_ < 100 and t - tr["t"] < 10]
+            if self.marks:
+                mk = max(self.marks, key=lambda m: m[0])
+                if mk[3] in ("gun", "laser", "lightning", "step", "boost", "reload"):
+                    tgt = (mk[1], mk[2])
+            if tgt is None:
+                tgt = (rc[0], rc[1])
+            if math.hypot(tgt[0] - rc[0], tgt[1] - rc[1]) > rr:
+                tgt = (rc[0], rc[1])
+            if math.hypot(tgt[0] - x, tgt[1] - y) > 25:
+                return "hunt", tgt, self.go_to(x, y, z, tgt, tick, deadline), None
         # 6) tactical nest (low exposure spot beside a building), then hold
         if self.nest is None or math.hypot(self.nest[0] - rc[0], self.nest[1] - rc[1]) > rr - 3:
             self.nest = self.pick_nest(x, y, rc, rr)
