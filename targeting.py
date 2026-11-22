@@ -1,53 +1,137 @@
-"""Target ranking for the mech bot.  LOWER score = kill first.
+"""Target ranking for mechfight/1.  Standard library only, ~10 microseconds per enemy.
 
-score = W_DIST*dist_n + W_HP*hp_n - W_THREAT*threat_n - W_OPP*opp_n  (+ NO_LOS_PENALTY if no clean shot)
+rank_targets(...) gives every visible enemy mech a number; LOWER number = kill it FIRST.
 
-All four features are scaled to 0..1 so the weights are directly comparable.
+    score = W_DIST * dist_n + W_HP * hp_n - W_THREAT * threat_n - W_OPP * opp_n
+
+All four features are normalised to 0..1:
+    dist_n    distance / 200 m                        (far   -> bigger number -> later)
+    hp_n      enemy hp / 1400                          (tanky -> bigger number -> later)
+    threat_n  damage/s it can do to ME at this range   (dangerous -> smaller number -> sooner)
+    opp_n     attack opportunity: 1 = it is not facing me (rear hits x1.5, slow to answer),
+              0 = it is aiming right at me
+
+should_engage(...) answers the more important survivor question: is this fight worth it at all?
 """
 import math
 
+# weights tuned by tune_targeting.py (see the review for the numbers)
+W_DIST, W_HP, W_THREAT, W_OPP = 0.25, 0.35, 0.40, 0.0
+
 TAU = 2 * math.pi
 
-# tuned offline with tune_weights.py (see its docstring for what the oracle assumes)
-WEIGHTS = {"dist": 0.35, "hp": 0.40, "threat": 0.15, "opp": 0.10}
-NO_LOS_PENALTY = 2.0
 
-# rough per-weapon danger to *me* when it is in range (0..1 scale)
-WEAPON_THREAT = {"gun": 0.30, "laser": 0.90, "lightning": 0.75, "mortar": 0.60}
-WEAPON_RANGE = {"gun": 230.0, "laser": 280.0, "lightning": 45.0, "mortar": 235.0}
-HP_REF = 1960.0   # 1400 base * 1.4 (10 cubes)
-
-
-def wrap(a):
+def _wrap(a):
     return (a + math.pi) % TAU - math.pi
 
 
-def threat_n(weapons, d, facing_err, charging_at_me=False):
-    """How dangerous this enemy is to me right now. facing_err = angle between its aim and the line to me."""
-    s = 0.0
-    for w in weapons or ("gun",):
-        if d <= WEAPON_RANGE.get(w, 100.0) and not (w == "mortar" and d < 10):
-            s += WEAPON_THREAT.get(w, 0.3)
-    f = 0.35 + 0.65 * max(0.0, 1.0 - facing_err / math.pi)      # pointing away -> less dangerous
-    s *= f
-    if charging_at_me:
-        s += 0.5
-    return min(1.0, s)
+def hit_prob(d):
+    """Rough chance a led gun bullet hits a dodging mech at distance d (m)."""
+    return max(0.1, min(0.95, 1.0 - d / 250.0))
 
 
-def opp_n(d, facing_err, turn_needed, in_range):
-    """How good a moment this is to shoot it: its back to me (x1.5 rear damage), little turning, in range."""
-    rear = 1.0 if facing_err > math.pi / 2 else facing_err / (math.pi / 2) * 0.5
-    align = max(0.0, 1.0 - turn_needed / math.pi)
-    rng = 1.0 if in_range else max(0.0, 1.0 - (d - 170.0) / 100.0)
-    return 0.4 * rear + 0.3 * align + 0.3 * rng
+def weapon_dps(kind, d):
+    """Damage/s one weapon of this kind does at range d (defaults; read real numbers from config)."""
+    if kind == "gun":
+        return 187.5 * hit_prob(d) if d <= 230 else 0.0
+    if kind == "laser":
+        return 130.0 if d <= 280 else 0.0
+    if kind == "lightning":
+        return 240.0 if d <= 45 else 0.0
+    if kind == "mortar":
+        return 90.0 if 15 <= d <= 235 else 0.0      # slow shell, often dodged
+    return 0.0
 
 
-def score(d, hp, weapons, facing_err, turn_needed, clear, charging_at_me=False, w=None, gun_range=170.0):
-    w = w or WEIGHTS
-    d_n = min(1.0, d / 200.0)
-    h_n = min(1.0, hp / HP_REF) if hp is not None else 0.5
-    t_n = threat_n(weapons, d, facing_err, charging_at_me)
-    o_n = opp_n(d, facing_err, turn_needed, d <= gun_range)
-    s = w["dist"] * d_n + w["hp"] * h_n - w["threat"] * t_n - w["opp"] * o_n
-    return s + (0.0 if clear else NO_LOS_PENALTY)
+def facing_angle(enemy, me_pos):
+    """Angle between where the enemy aims and the direction from it to me (0 = aiming at me)."""
+    ex, ey = enemy["pos"][0], enemy["pos"][1]
+    to_me = math.atan2(me_pos[1] - ey, me_pos[0] - ex)
+    return abs(_wrap(enemy["aim"][0] - to_me))
+
+
+def opportunity(enemy, me_pos):
+    a = facing_angle(enemy, me_pos)
+    if a > math.pi / 2:
+        return 1.0          # its back is to me: rear armor x1.5 and it must turn first
+    if a > 0.5:
+        return 0.5          # looking roughly elsewhere
+    return 0.0              # looking at me
+
+
+def features(enemy, me_pos):
+    d = math.dist(enemy["pos"][:2], me_pos[:2])
+    weps = enemy.get("weapons") or ["gun"]
+    threat = sum(weapon_dps(k, d) for k in weps)
+    if enemy.get("charging"):
+        threat += 150.0     # a laser is about to fire
+    hp = enemy.get("hp", 1400.0)
+    return d, hp, threat, opportunity(enemy, me_pos)
+
+
+def score(d, hp, threat, opp, w=None):
+    wd, wh, wt, wo = w or (W_DIST, W_HP, W_THREAT, W_OPP)
+    return (wd * min(d / 200.0, 1.0) + wh * min(hp / 1400.0, 1.5)
+            - wt * min(threat / 400.0, 1.0) - wo * opp)
+
+
+def rank_targets(mechs, me_pos, w=None):
+    """[(score, enemy), ...] sorted, lowest score (= kill first) first. NPCs are skipped."""
+    out = []
+    for m in mechs:
+        if m.get("kind") != "mech":
+            continue
+        out.append((score(*features(m, me_pos), w=w), m))
+    out.sort(key=lambda e: e[0])
+    return out
+
+
+# ---------------------------------------------------------------- should I fight at all?
+def my_dps(my_kinds, d, rear):
+    return sum(weapon_dps(k, d) for k in my_kinds) * (1.5 if rear else 1.0)
+
+
+def expected_damage(order, my_kinds, me_aim_target_bearing=None):
+    """Very small fight model.  `order` = list of dicts with d, hp, threat, opp, bearing.
+    Kill them one by one in that order; return damage I take meanwhile.
+    Enemies already facing me shoot from t=0, others start after a reaction delay; my target
+    takes rear damage until it has turned; enemies outside my front arc hit my back x1.5."""
+    t = 0.0
+    taken = 0.0
+    alive = list(order)
+    react = {id(e): (0.0 if e["opp"] == 0 else 0.4 if e["opp"] == 0.5 else 2.5) for e in order}
+    for tgt in order:
+        rate_rear = my_dps(my_kinds, tgt["d"], True)
+        rate = my_dps(my_kinds, tgt["d"], False)
+        if rate <= 0:
+            return float("inf")
+        turn_at = t + (0.0 if tgt["opp"] == 0 else 0.8)
+        react[id(tgt)] = min(react[id(tgt)], turn_at)
+        hp = tgt["hp"]
+        rear_time = max(0.0, turn_at - t) if tgt["opp"] > 0 else 0.0
+        if hp <= rate_rear * rear_time:
+            dt = hp / rate_rear
+        else:
+            dt = rear_time + (hp - rate_rear * rear_time) / rate
+        for e in alive:
+            start = max(t, react[id(e)])
+            if t + dt > start:
+                rear = abs(_wrap(e["bearing"] - tgt["bearing"])) > math.pi / 2
+                taken += e["threat"] * (1.5 if rear else 1.0) * (t + dt - start)
+        t += dt
+        alive.remove(tgt)
+    return taken
+
+
+def should_engage(ranked, me, my_kinds, margin=0.5):
+    """Engage only if killing every visible enemy (in ranked order) costs < margin * my hp."""
+    x, y = me["pos"][0], me["pos"][1]
+    order = []
+    for s, m in ranked:
+        d, hp, threat, opp = features(m, me["pos"])
+        order.append({"d": d, "hp": hp, "threat": threat, "opp": opp,
+                      "bearing": math.atan2(m["pos"][1] - y, m["pos"][0] - x)})
+    if not order:
+        return False, 0.0
+    dmg = expected_damage(order, my_kinds)
+    return dmg < margin * me["hp"], dmg

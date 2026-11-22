@@ -36,16 +36,12 @@ STYLE = "hunt"
 #   "farm" : v5 + much more drones / crates / cubes / supply drops (cubes = +4% HP & dmg + upgrades)
 #   "fight": v5 + duck behind walls from charging lasers, rush laser users up close, third-party, heal breaks
 VARIANT = "fight"
-# ---- v14: play by phase ----
-#   early (t < EARLY_END): grab a laser, fight only a LONE hunter (2+ in view -> retreat to cover)
-#   mid: stay silent in a measured hidden spot (hideouts.json) inside the next circle
-#   late (circle radius <= LATE_R or t >= LATE_T): heal to LATE_HP in a hideout, then hold the zone centre
-EARLY_END = 100.0
-LATE_R = 145.0
-LATE_T = 265.0
-LATE_HP = 0.9
-BUNKER = True
-DIST_COST = 0.03
+# ---- v15 ----
+MIN_HIT_P = 0.50         # gun: only fire when the estimated hit chance is at least this (moving target: ~185 m)
+CHASE_ENERGY = 40.0      # never sprint-chase below this (energy also = jumps, jets, zone escape)
+STRAFE_SWITCH = (0.25, 0.6)   # s between strafe direction flips (was 0.6-1.6)
+NAV_CACHE = "nav_cache.bin"   # precomputed by precompute_nav.py (the map never changes)
+NEST_CACHE = "nests.json"
 NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
@@ -132,7 +128,7 @@ class World:
     CELL = 40.0
     NAV = 4.0
 
-    def __init__(self, map_dir, seed, budget_s=5.0):
+    def __init__(self, map_dir, seed, budget_s=12.0, use_cache=True):
         t0 = time.perf_counter()
         self.deadline = t0 + budget_s
         self.prisms, self.grid = [], {}
@@ -141,16 +137,16 @@ class World:
         self.step, self.nx, self.ny = 1.0, 0, 0
         self.nav, self.navw, self.navh = None, 0, 0
         self.nests = []
-        self.hideouts = []
         try:
             with open(os.path.join(map_dir, "v2", "world.json")) as f:
                 w = json.load(f)
             self._load_prisms(w)
             self._load_terrain(map_dir, w)
-            self._build_nav()
-            self._build_nests(random.Random(seed))
-            self._components()
-            self._load_hideouts()
+            here = os.path.dirname(os.path.abspath(__file__))
+            if not (use_cache and self._load_nav_cache(os.path.join(here, NAV_CACHE))):
+                self._build_nav()
+            if not (use_cache and self._load_nest_cache(os.path.join(here, NEST_CACHE))):
+                self._build_nests(random.Random(seed))
         except Exception as e:
             mf.log("world init problem:", repr(e))
         mf.log(f"world: prisms={len(self.prisms)} nav={'y' if self.nav else 'n'} nests={len(self.nests)} {time.perf_counter()-t0:.2f}s")
@@ -219,68 +215,34 @@ class World:
                 return False
         return True
 
-    def top_at(self, x, y, z):
-        """Highest top of the solids standing in our way at (x, y) for a mech whose feet are at z."""
-        best = None
-        for i in self.grid.get((int(x // self.CELL), int(y // self.CELL)), ()):
-            base, top, ring, holes, x0, y0, x1, y1, _k = self.prisms[i]
-            if base > z + 9.0 or top < z + 1.2 or x < x0 or x > x1 or y < y0 or y > y1:
-                continue
-            if _pip(x, y, ring) and not any(_pip(x, y, h) for h in holes):
-                best = top if best is None else max(best, top)
-        return best
-
-    def _components(self):
-        self.comp = None
-        if self.nav is None:
-            return
-        w, h = self.navw, self.navh
-        comp = [0] * (w * h)
-        sizes = {}
-        label = 0
-        nav = self.nav
-        for start in range(w * h):
-            if nav[start] or comp[start]:
-                continue
-            label += 1
-            comp[start] = label
-            stack = [start]
-            n = 0
-            while stack:
-                k = stack.pop()
-                n += 1
-                cx, cy = k % w, k // w
-                for nb in ((k - 1) if cx > 0 else -1, (k + 1) if cx < w - 1 else -1,
-                           (k - w) if cy > 0 else -1, (k + w) if cy < h - 1 else -1):
-                    if nb >= 0 and not nav[nb] and not comp[nb]:
-                        comp[nb] = label
-                        stack.append(nb)
-            sizes[label] = n
-        self.comp = comp
-        self.main_comp = max(sizes, key=sizes.get) if sizes else 0
-
-    def on_foot(self, x, y):
-        if self.comp is None:
-            return True
-        cx, cy = self.cell(x, y)
-        return self.comp[cy * self.navw + cx] == self.main_comp
-
-    def _load_hideouts(self):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hideouts.json")
-        try:
-            with open(path) as f:
-                rows = json.load(f)
-            # keep the reasonably hidden ones: x, y, z, seen, near, shot, roof
-            self.hideouts = [{"id": i, "spot": (r[0], r[1], r[2]), "seen": r[3], "roof": bool(r[6]),
-                              "foot": (not r[6]) and self.on_foot(r[0], r[1])}
-                             for i, r in enumerate(rows) if r[3] <= 60]
-        except Exception as e:
-            mf.log("hideouts not loaded:", repr(e))
-
     def walk_blocked(self, x, y, z):
         return self.hit(x, y, z + 1.2, z + 9.0)
 
     # ----- navigation grid -----
+    def _load_nav_cache(self, path):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            w = int.from_bytes(raw[0:4], "little")
+            h = int.from_bytes(raw[4:8], "little")
+            exp_w, exp_h = int(self.nx * self.step / self.NAV), int(self.ny * self.step / self.NAV)
+            if (w, h) != (exp_w, exp_h) or len(raw) != 8 + w * h:
+                mf.log("nav cache does not match this map; rebuilding")
+                return False
+            self.navw, self.navh, self.nav = w, h, bytearray(raw[8:])
+            return True
+        except Exception as e:
+            mf.log("no nav cache:", repr(e))
+            return False
+
+    def _load_nest_cache(self, path):
+        try:
+            with open(path) as f:
+                self.nests = [tuple(n) for n in json.load(f)]
+            return bool(self.nests)
+        except Exception:
+            return False
+
     def _build_nav(self):
         if self.terr is None:
             return
@@ -291,7 +253,11 @@ class World:
         offs = ((0, 0), (1.5, 1.5), (-1.5, 1.5), (1.5, -1.5), (-1.5, -1.5))
         for cy in range(self.navh):
             if time.perf_counter() > self.deadline:
-                break
+                # a half-built grid would mark unbuilt rows as free -> A* through buildings.
+                # better no planner at all (steer-only) than a wrong one.
+                mf.log("nav build ran out of time at row", cy, "of", self.navh, "- planner disabled")
+                self.nav = None
+                return
             for cx in range(self.navw):
                 x = self.minx + (cx + 0.5) * cs
                 y = self.miny + (cy + 0.5) * cs
@@ -343,7 +309,7 @@ class World:
                     edges.append((ring, ax, ay, bx, by))
         rnd.shuffle(edges)
         dirs = [(math.cos(TAU * k / 16), math.sin(TAU * k / 16)) for k in range(16)]
-        for ring, ax, ay, bx, by in edges[:600]:
+        for ring, ax, ay, bx, by in (edges if getattr(self, "all_edges", False) else edges[:600]):
             if time.perf_counter() > self.deadline:
                 break
             mx, my = (ax + bx) / 2, (ay + by) / 2
@@ -437,7 +403,7 @@ class Planner:
 
 
 class Bot:
-    name = "survivor-v14"
+    name = "survivor-v15"
 
     def __init__(self, hello):
         seed = int(hello.get("seed", 0)) ^ (int(hello.get("slot", 0)) * 7919)
@@ -463,14 +429,6 @@ class Bot:
         self.beam_t = {}             # enemy id -> time of its last laser beam
         self.laser_threat_t = -99.0  # last time a laser was charging at us / hit us
         self.last_mech_seen = -99.0
-        self.bunker = None
-        self.bunker_fail = {}
-        self.climb_t0 = None
-        self.climb_top = None
-        self.exit_from = None
-        self.direct = False
-        self.fail_areas = {}
-        self.phase = "early"
         cfg = hello.get("config", {})
         self.pick_r = cfg.get("loot", {}).get("pickup_radius", 4.0) - 0.6
 
@@ -480,6 +438,8 @@ class Bot:
             ty = ev.get("type")
             if ty == "take_failed":
                 self.bad.add(ev["id"])
+            elif ty == "kill":
+                self.kill_t = t
             elif ty == "damaged":
                 self.last_dmg = t
                 if ev.get("weapon") == "laser":
@@ -579,27 +539,6 @@ class Bot:
             wp = pl.path[min(pl.i + 1, len(pl.path) - 1)]
             return self.steer(x, y, z, wp[0], wp[1])
         return self.steer(x, y, z, gx, gy)
-
-    def walkable_near(self, cx, cy):
-        """Nearest nav cell to (cx, cy) that is free AND reachable on foot from the open map."""
-        W_ = self.world
-        if W_.nav is None:
-            return (cx, cy)
-        c0 = W_.cell(cx, cy)
-        for r in range(0, 45):
-            best = None
-            for dx in range(-r, r + 1):
-                for dy in ((-r, r) if abs(dx) != r else range(-r, r + 1)):
-                    c = (c0[0] + dx, c0[1] + dy)
-                    if W_.free(c):
-                        p = W_.center(c)
-                        if W_.on_foot(*p):
-                            d = math.hypot(p[0] - cx, p[1] - cy)
-                            if best is None or d < best[0]:
-                                best = (d, p)
-            if best:
-                return best[1]
-        return (cx, cy)
 
     def find_cover(self, x, y, z, threats, rc, rr, deadline):
         ts = [(p[0], p[1], p[2] + 8.0) for p in threats[:3]]
@@ -748,6 +687,8 @@ class Bot:
             turn = abs(wrap(math.atan2(tp[1] - y, tp[0] - x) - cur[0]))
             chg = bool(m.get("charging")) and f_err < math.atan2(6.0, max(d, 10.0))
             sc = T.score(d, m.get("hp"), m.get("weapons") or ["gun"], f_err, turn, clear, chg)
+            if f_err > math.pi / 2:
+                sc -= 0.12          # its back is to us: rear hits do x1.5
             ranked.append((sc, d, m, clear, ch))
         ranked.sort(key=lambda r: r[0])
         clear_close = [r for r in ranked if r[3] and r[1] < (220 if VARIANT == "max" else 150)]
@@ -774,7 +715,7 @@ class Bot:
 
         if t >= self.side_until:
             self.side = self.rng.choice((-1, 1))
-            self.side_until = t + self.rng.uniform(0.6, 1.6)
+            self.side_until = t + self.rng.uniform(*STRAFE_SWITCH)
 
         # ---- laser rush: the built-in bots win with lasers, so get one first ----
         rush = None
@@ -789,64 +730,7 @@ class Bot:
                     rush = (p_, dp_)
         outgunned = li is None and (any("laser" in (r[2].get("weapons") or []) for r in clear_close)
                                     or t - self.laser_threat_t < 2.5)
-        # ---- v14 phase logic ----
-        zn = obs["zone"]
-        late = zn["radius"] <= LATE_R or t >= LATE_T
-        self.phase = "early" if t < EARLY_END and not late else ("late" if late else "mid")
-        pmode = None
-        if self.phase in ("mid", "late") and not (rush is not None and rush[1] < 30):
-            want_center = self.phase == "late" and hpr >= LATE_HP
-            if not want_center:
-                bunker = self.choose_bunker(obs, x, y, rc, rr)
-                if bunker is not None:
-                    pmode, pmv, pdirect = self.bunker_move(bunker, me, x, y, z, t, tick, deadline)
-                    if pdirect and not self.climb_assist(act, me, x, y, z, pmv):
-                        pmode, pmv = "bunker-charge", (0.0, 0.0)
-                    pgoal = bunker["spot"]
-                else:
-                    want_center = self.phase == "late"
-            if want_center:
-                c = zn["next_center"] if t >= zn["shrink_start"] - 10 else zn["center"]
-                # the centre can be inside a building: hold the nearest walkable spot instead
-                key_ = (round(c[0], 1), round(c[1], 1))
-                if getattr(self, "center_key", None) != key_:
-                    self.center_key = key_
-                    W_ = self.world
-                    self.center_pt = self.walkable_near(c[0], c[1])
-                    self.cprog = None
-                c = self.center_pt
-                pgoal = (c[0], c[1])
-                true_c = zn["next_center"] if t >= zn["shrink_start"] - 10 else zn["center"]
-                lim = 0.5 * min(zn["radius"], max(zn["next_radius"], 10.0))
-                if math.hypot(c[0] - true_c[0], c[1] - true_c[1]) > lim:
-                    want_center = False               # centre unreachable on foot (e.g. inside the stadium)
-            if want_center:
-                dcen = math.hypot(c[0] - x, c[1] - y)
-                cp_ = getattr(self, "cprog", None)
-                if cp_ is None:
-                    self.cprog = [t, dcen, False]
-                elif t - cp_[0] > 4.0:
-                    if dcen > cp_[1] - 3.0 and dcen > 4:
-                        cp_[2] = True                 # no progress: go straight, climbing what is in the way
-                    cp_[0], cp_[1] = t, dcen
-                if dcen > 4:
-                    if self.cprog[2]:
-                        pmv = norm2(c[0] - x, c[1] - y)
-                        if not self.climb_assist(act, me, x, y, z, pmv):
-                            pmv = (0.0, 0.0)
-                        pmode = "center"
-                    else:
-                        pmode, pmv = "center", self.go_to(x, y, z, pgoal, tick, deadline)
-                else:
-                    pmode, pmv = "center-hold", (0.0, 0.0)
-            # a fight right on top of us (< 25 m) still gets the normal duel movement; dodges always win
-            close_fight = any(r[1] < 25 for r in clear_close)
-            if dg or close_fight:
-                pmode = None
-        if pmode is not None:
-            mode, goal, mv = pmode, pgoal, pmv
-            urgent = pmode not in ("bunker", "bunker-in", "center-hold")
-        elif rush is not None and not dg:
+        if rush is not None and not dg:
             p_, dp_ = rush
             if dp_ < self.pick_r and abs(p_["pos"][2] - z) < 4:
                 act["take"] = p_["id"]
@@ -868,7 +752,7 @@ class Bot:
             tr = self.tracks.get(m["id"], {})
             rate = tr.get("rate", 0.0)
             weak = hpr < (0.6 if STYLE == "hide" else 0.3)
-            group = len(clear_close) >= (2 if (STYLE == "hide" or t < EARLY_END) else 3)
+            group = len(clear_close) >= (2 if STYLE == "hide" else 3)
             urgent = True
             if VARIANT == "max":
                 group = weak = outgunned = False          # never retreat
@@ -898,6 +782,12 @@ class Bot:
                     boost = me["energy"] > 30
                 else:
                     sp_ = 140.0 if li is not None else DUEL_DIST
+                ehp = (m.get("hp") or 1400) / max(m.get("max_hp") or 1400, 1)
+                facing_away = abs(wrap(m["aim"][0] - math.atan2(y - tp[1], x - tp[0]))) > math.pi / 2
+                if me["energy"] >= CHASE_ENERGY and ehp < 0.4 and rate > 1.0:
+                    sp_, boost, mode = 15.0, True, "chase-weak"      # it is fleeing hurt: run it down
+                elif me["energy"] >= CHASE_ENERGY and facing_away and d > 60:
+                    sp_, boost, mode = min(sp_, 60.0), True, "flank"  # its back is to us: close in for x1.5 hits
                 mv = self.radial_strafe(d, rate, bearing, sp_)
             if not me["in_zone"]:
                 bx, by = self.steer(x, y, z, rp[0], rp[1])
@@ -912,6 +802,12 @@ class Bot:
             mode, urgent = "chase", True
             mv = self.go_to(x, y, z, goal, tick, deadline)
             boost = me["energy"] > 40
+        elif (hidden_vis and me["energy"] >= CHASE_ENERGY and inside and not self.healing
+              and (hidden_vis[0][2].get("hp") or 1400) / max(hidden_vis[0][2].get("max_hp") or 1400, 1) < 0.4
+              and hidden_vis[0][1] < 120):
+            tp = hidden_vis[0][2]["pos"]
+            mode, goal, urgent, boost = "chase-weak", (tp[0], tp[1]), True, True
+            mv = self.go_to(x, y, z, goal, tick, deadline)
         elif hidden_vis or recent_dmg:
             mode = "wary"
             self.cover = None
@@ -932,7 +828,7 @@ class Bot:
                 boost = me["energy"] > 50 and mode == "hunt"
 
         # ---------- apply movement ----------
-        if mode in ("hold", "crate", "heal", "take", "bunker", "bunker-charge", "center-hold") or (mv[0] == 0 and mv[1] == 0):
+        if mode in ("hold", "crate", "heal", "take") or (mv[0] == 0 and mv[1] == 0):
             move = [0.0, 0.0]
         else:
             sc_move = 1.0 if urgent else (0.75 if mode == "drop" else NOISE_FREE)
@@ -942,11 +838,11 @@ class Bot:
             act["boost"] = True
 
         spd = math.hypot(me["vel"][0], me["vel"][1])
-        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt", "chase", "farmgo", "bunker-go", "center") and (move[0] or move[1]) and spd < 1.5:
+        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt", "chase", "farmgo", "chase-weak") and (move[0] or move[1]) and spd < 1.5:
             self.stuck += 1
         else:
             self.stuck = max(0, self.stuck - 2) if self.stuck < 20 else 0
-        if 6 <= self.stuck < 20 and not mode.startswith("bunker"):
+        if 6 <= self.stuck < 20:
             act["jump"] = True
             act["boost"] = True
             if self.stuck % 12 == 0:
@@ -1007,9 +903,13 @@ class Bot:
             act["aim"] = [aim[0], aim[1]]
         if fire[0] or fire[1]:
             act["fire"] = fire
-        elif gi is not None and not threat_pos:
+        elif gi is not None and target is None:
+            # nobody in a clean line of fire right now (it died, or ducked behind cover): reload now,
+            # not in the middle of the next fight
             gs = weapons[gi]
-            if gs.get("ammo", 99) < gs["stats"].get("mag", 12) * 0.6 and gs.get("reload", 0) <= 0:
+            mag = gs["stats"].get("mag", 12)
+            just_killed = t - getattr(self, "kill_t", -99.0) < 2.0
+            if gs.get("reload", 0) <= 0 and (gs.get("ammo", 99) < mag * 0.6 or (just_killed and gs.get("ammo", 99) < mag * 0.85)):
                 act["reload"] = True
 
         # ---------- debug ----------
@@ -1024,99 +924,6 @@ class Bot:
             mf.draw.point([mk[1], mk[2], z], "#ffd060", 3)
             mf.draw.text(f"{mk[3]} {mk[4]}: {SOUND_WEAPON.get(mk[3], '?')}", [mk[1], mk[2], z + 3], "#ffd060")
         return act
-
-    # ------------------------------------------------------------ v8 hideouts
-    def at_spot(self, c, x, y, z):
-        sx, sy, sz = c["spot"]
-        return math.hypot(sx - x, sy - y) < 2.5 and abs(z - sz) < 2.5
-
-    def choose_bunker(self, obs, x, y, rc, rr):
-        if not BUNKER or not self.world.hideouts:
-            return None
-        zn = obs["zone"]
-        nc, nr = zn["next_center"], zn["next_radius"]
-        def score(c):
-            sx, sy, _ = c["spot"]
-            if math.hypot(sx - rc[0], sy - rc[1]) > rr - 5 or math.hypot(sx - nc[0], sy - nc[1]) > nr - 12:
-                return None
-            pen = 0.0 if c["foot"] else 12.0
-            for (fx, fy), n in self.fail_areas.items():
-                if math.hypot(sx - fx, sy - fy) < 25:
-                    pen += 30.0 * n
-            return c["seen"] + pen + DIST_COST * math.hypot(sx - x, sy - y)
-        cur = score(self.bunker) if self.bunker is not None else None
-        best, bs = None, 1e18
-        for c in self.world.hideouts:
-            v = score(c)
-            if v is not None and v < bs:
-                best, bs = c, v
-        if best is None:
-            return None if cur is None else self.bunker
-        if cur is not None and bs > cur - 15.0:      # commit: only switch for a clearly better spot
-            return self.bunker
-        if best is not self.bunker:
-            self.bunker = best
-            self.climb_t0 = None
-            self.direct = False
-        return best
-
-    def bunker_move(self, c, me, x, y, z, t, tick, deadline):
-        """Returns (mode, mv, direct).  direct=True: walk straight at it and climb whatever is in the way."""
-        sx, sy, sz = c["spot"]
-        d = math.hypot(sx - x, sy - y)
-        if self.at_spot(c, x, y, z):
-            self.climb_t0 = None
-            return "bunker", (0.0, 0.0), False
-        elevated = z - self.world.ground(x, y) > 4.0 and abs(z - sz) > 2.5     # on the wrong roof
-        pl = self.plan
-        path_done = (pl is not None and not pl.active and pl.path and pl.i >= len(pl.path) - 2
-                     and pl.goal is not None and math.hypot(pl.goal[0] - sx, pl.goal[1] - sy) < 3)
-        if not getattr(self, "direct", False):
-            if (elevated or d < (6 if c["foot"] else 14) or (c["roof"] and d < 35) or self.stuck >= 15
-                    or (pl is not None and pl.failed) or (path_done and d > 4)):
-                self.direct = True
-        # progress check: bouncing in place without getting closer -> go straight and climb
-        pg = getattr(self, "prog", None)
-        if pg is None or pg[2] is not c:
-            self.prog = (t, d, c)
-        elif t - pg[0] > 4.0:
-            if d > pg[1] - 3.0:
-                self.direct = True
-            self.prog = (t, d, c)
-        if not self.direct:
-            self.climb_t0 = None
-            return "bunker-go", self.go_to(x, y, z, (sx, sy), tick, deadline), False
-        if self.climb_t0 is None:
-            self.climb_t0 = t
-        elif t - self.climb_t0 > 12.0:             # cannot get there: penalise it and pick again
-            self.bunker_fail[c["id"]] = self.bunker_fail.get(c["id"], 0) + 1
-            key = (round(sx, -1), round(sy, -1))
-            self.fail_areas[key] = self.fail_areas.get(key, 0) + 1
-            self.climb_t0 = None
-            self.direct = False
-            self.bunker = None
-        return "bunker-climb", norm2(sx - x, sy - y), True
-
-    def climb_assist(self, act, me, x, y, z, mv):
-        """Jump + jet over the solid in front of us; returns False if we must wait for energy."""
-        if mv[0] == 0 and mv[1] == 0:
-            return True
-        px, py = x + mv[0] * 3.5, y + mv[1] * 3.5
-        top = self.world.top_at(px, py, z)
-        if me["grounded"]:
-            # on the ground: only the wall right in front of us counts (forget older, taller ones)
-            self.climb_top = top if (top is not None and top - z < 50) else None
-        elif top is not None and top - z < 50 and (self.climb_top is None or top > self.climb_top):
-            self.climb_top = top
-        if self.climb_top is not None and z < self.climb_top + 2.0:
-            if me["grounded"]:
-                need = min(95.0, 1.6 * (self.climb_top - z) + 10.0)
-                if me["energy"] < need:
-                    return False
-                act["jump"] = True
-            else:
-                act["boost"] = True
-        return True
 
     # ------------------------------------------------------------ helpers used by act()
     def radial_strafe(self, d, rate, bearing, setpoint):
@@ -1232,6 +1039,19 @@ class Bot:
             return "nest", self.nest, self.go_to(x, y, z, self.nest, tick, deadline), None
         return "hold", self.nest, (0.0, 0.0), None
 
+    @staticmethod
+    def gun_hit_p(muzzle, tc, vel, d, speed, spread_deg, radius=2.5):
+        """Rough chance a led bullet hits: spread + how far the target can juke during the flight."""
+        tf = d / speed
+        bx, by = tc[0] - muzzle[0], tc[1] - muzzle[1]
+        n = math.hypot(bx, by) or 1.0
+        v_perp = abs(-vel[0] * by / n + vel[1] * bx / n)
+        # calibrated on lead_test.py (targets changing direction every ~0.7 s): ~99% at 80 m,
+        # ~64% at 150 m, ~40% at 220 m for a walking target; spread alone for a standing one
+        juke = 0.25 * min(0.5 * 58.5 * tf * tf, 2.0 * v_perp * tf)
+        sig = math.hypot(d * math.tan(math.radians(spread_deg)), juke)
+        return clampf(math.erf((radius + 0.3) / (sig * 1.4142 + 1e-9)), 0.0, 0.99)
+
     def shoot(self, me, weapons, gi, li, ni, mi, muzzle, cur, tc, vel, acc, d, clear, tick, gun_range):
         """Choose weapon + aim for target centre tc. Returns (aim, fire[2])."""
         fire = [False, False]
@@ -1277,8 +1097,12 @@ class Bot:
             aim = lead_aim(muzzle, tc, vel, acc, gs["stats"].get("speed", 252.0))
             thr = clampf(math.atan2(3.0, d), 0.02, 0.15)
             err = max(abs(wrap(aim[0] - cur[0])), abs(aim[1] - cur[1]))
-            rng = min(gs["stats"].get("range", 230.0), gun_range)
-            if clear and err < thr and d <= rng and gs.get("ammo", 1) > 0 and gs.get("reload", 0) <= 0:
+            rng = gs["stats"].get("range", 230.0)
+            p_hit = self.gun_hit_p(muzzle, tc, vel, d, gs["stats"].get("speed", 252.0), gs["stats"].get("spread_deg", 0.6))
+            if gun_range < 100:
+                rng = min(rng, gun_range)           # farming: keep the old short range
+            need_p = MIN_HIT_P if gs.get("ammo", 12) > 4 else 0.75    # keep the last rounds for good shots
+            if clear and err < thr and d <= rng and p_hit >= need_p and gs.get("ammo", 1) > 0 and gs.get("reload", 0) <= 0:
                 fire[gi] = True
         if ni is not None and d <= 42 and me["energy"] >= 5 and not fire[ni]:
             if abs(wrap(direct_aim(muzzle, tc)[0] - cur[0])) < 0.2:
