@@ -35,9 +35,7 @@ STYLE = "hunt"
 #   "max"  : pure aggression - chase, never retreat, never heal first, sprint, farm on the way
 #   "farm" : v5 + much more drones / crates / cubes / supply drops (cubes = +4% HP & dmg + upgrades)
 #   "fight": v5 + duck behind walls from charging lasers, rush laser users up close, third-party, heal breaks
-VARIANT = "combo"
-# v10 = v9-fight (4.04) + v9-max aggression (3.88), without farming (v9-farm 2.89 hurt)
-HEAL_BREAKS = False        # v10b
+VARIANT = "fight"
 NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
@@ -368,7 +366,7 @@ class Planner:
 
 
 class Bot:
-    name = "survivor-v2"
+    name = "survivor-v11a"
 
     def __init__(self, hello):
         seed = int(hello.get("seed", 0)) ^ (int(hello.get("slot", 0)) * 7919)
@@ -423,10 +421,12 @@ class Bot:
             d = min(d, 0.8 * 320.0)
             b = s["bearing"]
             self.marks.append((t - s["age"], x + d * math.cos(b), y + d * math.sin(b), k, s["dist"]))
-            key = (rank.get(s["dist"], 2), s["age"])
+            danger = k in ("laser_charge", "laser", "gun", "lightning")
+            key = (0 if danger else 1, rank.get(s["dist"], 2), s["age"])
             if best is None or key < best[0]:
                 best = (key, b)
-        if best and best[0][0] <= 1 and (self.tb is None or self.tb[1] < t - 1.0):
+        # a near/mid laser charge or gunshot turns us at once; other sounds only if nothing fresher
+        if best and best[0][1] <= 1 and (best[0][0] == 0 or self.tb is None or self.tb[1] < t - 1.0):
             self.tb = (best[1], t)
 
     def update_tracks(self, obs, t, x, y):
@@ -530,6 +530,12 @@ class Bot:
                 return best
         return None
 
+    def find_cover_cached(self, x, y, z, threats, rc, rr, deadline, tick):
+        if self.cover is None or tick - self.cover[0] >= 6:
+            self.cover = (tick, self.find_cover(x, y, z, threats, rc, rr, deadline))
+        cv = self.cover[1]
+        return cv is not None and math.dist(cv, (x, y)) < 20
+
     def pick_nest(self, x, y, rc, rr):
         best, bs = None, 1e18
         for px, py, ex in self.world.nests:
@@ -579,7 +585,7 @@ class Bot:
                 along = rx * ux + ry * uy
                 s = rx * -uy + ry * ux
                 if along > 0 and abs(s) < 6.0 and math.hypot(rx, ry) < 290:
-                    if True:
+                    if VARIANT == "fight":
                         # a laser can't be strafed (instant, they track us) but it can't go through walls:
                         # step to the nearest point within 10 m that the shooter can't see
                         src = (ex, ey, m["pos"][2] + 7.0)
@@ -625,10 +631,10 @@ class Bot:
         slot_of = {w["kind"]: i for i, w in enumerate(weapons) if w}
         gi, li, ni, mi = slot_of.get("gun"), slot_of.get("laser"), slot_of.get("lightning"), slot_of.get("mortar")
         hpr = me["hp"] / max(me["max_hp"], 1.0)
-        heal_lo = 0.35 if HEAL_BREAKS else -1.0
+        heal_lo = {"max": -1.0, "farm": 0.25, "fight": 0.35}[VARIANT]
         if hpr < heal_lo:
             self.healing = True
-        elif hpr >= 0.8:
+        elif hpr >= (0.8 if VARIANT == "fight" else 0.75):
             self.healing = False
         cur = me["aim"]
         muzzle = (x, y, z + muz_h)
@@ -652,7 +658,7 @@ class Bot:
             sc = T.score(d, m.get("hp"), m.get("weapons") or ["gun"], f_err, turn, clear, chg)
             ranked.append((sc, d, m, clear, ch))
         ranked.sort(key=lambda r: r[0])
-        clear_close = [r for r in ranked if r[3] and r[1] < 220]
+        clear_close = [r for r in ranked if r[3] and r[1] < (220 if VARIANT == "max" else 150)]
         target = next((r for r in ranked if r[3] and r[1] < 220), None)
         hidden_vis = [r for r in ranked if not r[3] and r[1] < 200]
         threat_pos = [r[2]["pos"] for r in ranked if r[1] < 200]
@@ -715,12 +721,12 @@ class Bot:
             weak = hpr < (0.6 if STYLE == "hide" else 0.3)
             group = len(clear_close) >= (2 if STYLE == "hide" else 3)
             urgent = True
-            group = weak = False                          # aggression: numbers / hp never make us retreat
-            close_in = outgunned and d < 100 and not self.healing
-            if close_in:
-                pass
-            elif outgunned and d >= 100 and not self.healing:
-                outgunned = False                         # far laser user: close the gap like max did
+            if VARIANT == "max":
+                group = weak = outgunned = False          # never retreat
+            # an enemy laser that just fired needs ~2.4 s to fire again -> push in during that window
+            window = any(t - self.beam_t.get(r[2]["id"], -99.0) < 1.5 for r in clear_close
+                         if "laser" in (r[2].get("weapons") or []))
+            close_in = outgunned and (d < 100 or (window and d < 170)) and not self.healing and hpr > 0.4
             if close_in:
                 outgunned = False                         # rush the laser user: up close our gun hits, it charges at half speed
             if group or self.healing or weak or outgunned:
@@ -735,10 +741,17 @@ class Bot:
                 else:
                     sp = RETREAT_DIST
                     mv = self.radial_strafe(d, rate, bearing, sp)
+            elif (li is not None and weapons[li]["cooldown"] > 0.6 and weapons[li].get("charge", 0) <= 0
+                  and not close_in and self.find_cover_cached(x, y, z, threat_pos, rc, rr, deadline, tick)):
+                # peek-and-hide: our laser just fired (1.65 s cooldown) -> step out of sight, pre-charge
+                # behind cover, peek out again (shoot() releases once lined up)
+                cv = self.cover[1]
+                mode, goal = "peek-hide", cv
+                mv = self.go_to(x, y, z, cv, tick, deadline) if math.dist(cv, (x, y)) > 2 else (0.0, 0.0)
             else:
                 mode = "duel"
                 # with a laser, stay far: gun bots miss at 140 m, our beam does not
-                if not close_in:
+                if VARIANT == "max":
                     sp_ = 110.0 if li is not None else 30.0
                     boost = me["energy"] > 40
                 elif close_in:
@@ -750,7 +763,7 @@ class Bot:
             if not me["in_zone"]:
                 bx, by = self.steer(x, y, z, rp[0], rp[1])
                 mv = norm2(mv[0] + bx, mv[1] + by)
-        elif (hidden_vis or recent_dmg) and inside and not self.healing:
+        elif VARIANT == "max" and (hidden_vis or recent_dmg) and inside:
             self.cover = None
             if hidden_vis:
                 tp = hidden_vis[0][2]["pos"]
@@ -775,7 +788,7 @@ class Bot:
                                                  t, tick, deadline, act, muzzle)
             if mode in ("zone", "drop"):
                 urgent = urgent or mode == "zone"
-            if mode in ("hunt", "farmgo", "cubes", "loot", "nest"):
+            if VARIANT == "max" and mode in ("hunt", "farmgo", "cubes", "loot", "nest"):
                 urgent = True
                 boost = me["energy"] > 50 and mode == "hunt"
 
@@ -847,10 +860,15 @@ class Bot:
                     aim = (math.atan2(tp[1] - y, tp[0] - x), 0.0)
                 elif self.tb and t - self.tb[1] < 4.0:
                     aim = (self.tb[0], 0.0)
-                elif (move[0] or move[1]) and mode in ("zone", "loot", "nest", "cubes", "drop", "hunt", "rush", "chase"):
-                    aim = (math.atan2(move[1], move[0]), 0.0)
+                elif t < 2.5:
+                    aim = (wrap(cur[0] + 1.2), 0.0)                    # opening spin: see lasers lying around us
+                elif move[0] or move[1]:
+                    # v11: keep scanning while walking.  Vision is a 120 deg cone (only 45 m all round), so
+                    # looking where we walk leaves 240 deg blind; a +-120 deg sweep covers everything
+                    # every ~4 s and the torso (4 rad/s) turns independently of the legs.
+                    aim = (wrap(math.atan2(move[1], move[0]) + 2.1 * math.sin(t * 1.6)), 0.0)
                 else:
-                    aim = (wrap(tick * 0.12), 0.0)
+                    aim = (wrap(cur[0] + 0.35), 0.0)                    # standing: slow full circle
         if aim is not None:
             act["aim"] = [aim[0], aim[1]]
         if fire[0] or fire[1]:
@@ -934,7 +952,7 @@ class Bot:
                 return "cubes", c["pos"], self.go_to(x, y, z, c["pos"], tick, deadline), None
         # 4) NPC drones (only healthy) and 5) crates, both with the gun
         quiet = not any(m[3] in ("gun", "laser", "lightning", "mortar") and m[4] == "near" for m in self.marks)
-        if True:
+        if VARIANT == "fight":
             farm_ok = hpr > 0.8 and quiet and t - self.last_mech_seen > 8.0
             shoot_r, walk_r = 45.0, 0.0
         elif VARIANT == "farm":
@@ -964,11 +982,11 @@ class Bot:
         if STYLE == "hunt":
             tgt = None
             recent = [tr for i_, tr in self.tracks.items() if i_ < 100 and t - tr["t"] < 15 and "pos" in tr]
-            if recent:
+            if VARIANT == "max" and recent:
                 tr_ = min(recent, key=lambda tr: math.dist(tr["pos"][:2], (x, y)))
                 tgt = (tr_["pos"][0], tr_["pos"][1])
             elif self.marks:
-                kinds = (("gun", "laser", "lightning", "explosion") if True
+                kinds = (("gun", "laser", "lightning", "explosion") if VARIANT == "fight"
                          else ("gun", "laser", "lightning", "step", "boost", "reload"))
                 ms = [m for m in self.marks if m[3] in kinds]
                 if ms:
