@@ -1,4 +1,4 @@
-"""Survivor bot v2 for mechfight/1  (standard library only).
+"""Survivor bot v3 (v9-fight + break-line-of-sight-first) for mechfight/1  (standard library only).
 
 Placement is the score, so: stay in the safe region, stay quiet, avoid groups, duel lone hunters,
 rank targets with targeting.score(), predict shots with velocity + 0.5*accel, keep every decision
@@ -366,7 +366,7 @@ class Planner:
 
 
 class Bot:
-    name = "survivor-v11b"
+    name = "survivor-v3-breaklos"
 
     def __init__(self, hello):
         seed = int(hello.get("seed", 0)) ^ (int(hello.get("slot", 0)) * 7919)
@@ -505,7 +505,7 @@ class Bot:
         ts = [(p[0], p[1], p[2] + 8.0) for p in threats[:3]]
         if not ts:
             return None
-        for d in (8, 16, 26):
+        for d in (8, 16, 26, 38):
             best, bd = None, 1e9
             for k in range(16):
                 a = TAU * k / 16
@@ -519,7 +519,12 @@ class Bot:
                         break
                 if ok:
                     dd = min(math.dist((px, py), (q[0], q[1])) for q in ts)
-                    score = d - 0.05 * dd
+                    pen = 0.0     # path to the cover is itself in view -> prefer covers reached unseen
+                    mx_, my_ = (x + px) / 2, (y + py) / 2
+                    for tx, ty, tz in ts[:2]:
+                        if self.world.los((tx, ty, tz), (mx_, my_, z + 5.0)):
+                            pen += 10.0
+                    score = d + pen - 0.05 * dd
                     if score < bd:
                         best, bd = (px, py), score
                 if time.perf_counter() > deadline:
@@ -527,6 +532,34 @@ class Bot:
             if best:
                 return best
         return None
+
+    def get_cover(self, tick, x, y, z, threats, rc, rr, deadline):
+        if self.cover is None or tick - self.cover[0] >= 6:
+            self.cover = (tick, self.find_cover(x, y, z, threats, rc, rr, deadline))
+        return self.cover[1]
+
+    def hide_steer(self, mv, x, y, z, ranked, deadline):
+        """While travelling, sidestep headings whose next 12 m is in view of an enemy that currently sees us."""
+        th = [r[2]["pos"] for r in ranked if r[3]][:2]
+        if not th:
+            return mv
+
+        def seen(a, blocked_bad):
+            px, py = x + 12 * math.cos(a), y + 12 * math.sin(a)
+            if blocked_bad and self.world.walk_blocked(px, py, z):
+                return True
+            return any(self.world.los((p[0], p[1], p[2] + 8.0), (px, py, z + 5.0)) for p in th)
+
+        base = math.atan2(mv[1], mv[0])
+        if not seen(base, False):
+            return mv
+        for off in (0.6, -0.6, 1.2, -1.2):
+            if time.perf_counter() > deadline:
+                break
+            a = base + off
+            if not seen(a, True):
+                return (math.cos(a), math.sin(a))
+        return mv
 
     def pick_nest(self, x, y, rc, rr):
         best, bs = None, 1e18
@@ -649,11 +682,12 @@ class Bot:
             chg = bool(m.get("charging")) and f_err < math.atan2(6.0, max(d, 10.0))
             sc = T.score(d, m.get("hp"), m.get("weapons") or ["gun"], f_err, turn, clear, chg)
             ranked.append((sc, d, m, clear, ch))
-        # a visible enemy under 300 hp within 150 m jumps the queue (kill = one fewer opponent)
-        ranked.sort(key=lambda r: (not (r[3] and (r[2].get("hp") or 9999) < 300 and r[1] < 150), r[0]))
+        ranked.sort(key=lambda r: r[0])
         clear_close = [r for r in ranked if r[3] and r[1] < (220 if VARIANT == "max" else 150)]
         target = next((r for r in ranked if r[3] and r[1] < 220), None)
         hidden_vis = [r for r in ranked if not r[3] and r[1] < 200]
+        far_clear = [r for r in ranked if r[3] and r[1] >= 150]      # they see us, too far to duel
+        bl = bool(far_clear) and (li is None or len(mech_list) >= 2 or self.healing)
         threat_pos = [r[2]["pos"] for r in ranked if r[1] < 200]
 
         rc, rr = self.region(obs)
@@ -721,9 +755,7 @@ class Bot:
                 outgunned = False                         # rush the laser user: up close our gun hits, it charges at half speed
             if group or self.healing or weak or outgunned:
                 mode = "retreat"
-                if self.cover is None or tick - self.cover[0] >= 6:
-                    self.cover = (tick, self.find_cover(x, y, z, threat_pos, rc, rr, deadline))
-                cv = self.cover[1]
+                cv = self.get_cover(tick, x, y, z, threat_pos, rc, rr, deadline)
                 if cv and math.dist(cv, (x, y)) > 2:
                     goal = cv
                     mv = self.go_to(x, y, z, cv, tick, deadline)
@@ -746,6 +778,11 @@ class Bot:
             if not me["in_zone"]:
                 bx, by = self.steer(x, y, z, rp[0], rp[1])
                 mv = norm2(mv[0] + bx, mv[1] + by)
+        elif (bl and inside and me["in_zone"]
+              and (cv_bl := self.get_cover(tick, x, y, z, [r[2]["pos"] for r in far_clear], rc, rr, deadline)) is not None
+              and math.dist(cv_bl, (x, y)) > 2):
+            mode, goal, urgent = "breaklos", cv_bl, True      # leave their view first, then carry on
+            mv = self.go_to(x, y, z, cv_bl, tick, deadline)
         elif VARIANT == "max" and (hidden_vis or recent_dmg) and inside:
             self.cover = None
             if hidden_vis:
@@ -775,6 +812,9 @@ class Bot:
                 urgent = True
                 boost = me["energy"] > 50 and mode == "hunt"
 
+        if me["in_zone"] and mode in ("zone", "loot", "drop", "cubes", "nest", "hunt", "rush", "farmgo") and (mv[0] or mv[1]):
+            mv = self.hide_steer(mv, x, y, z, ranked, deadline)
+
         # ---------- apply movement ----------
         if mode in ("hold", "crate", "heal", "take") or (mv[0] == 0 and mv[1] == 0):
             move = [0.0, 0.0]
@@ -786,7 +826,7 @@ class Bot:
             act["boost"] = True
 
         spd = math.hypot(me["vel"][0], me["vel"][1])
-        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt", "chase", "farmgo") and (move[0] or move[1]) and spd < 1.5:
+        if mode in ("zone", "loot", "cover", "retreat", "breaklos", "nest", "cubes", "drop", "rush", "hunt", "chase", "farmgo") and (move[0] or move[1]) and spd < 1.5:
             self.stuck += 1
         else:
             self.stuck = max(0, self.stuck - 2) if self.stuck < 20 else 0
