@@ -18,7 +18,7 @@ import targeting as T
 
 TAU = 2 * math.pi
 NOISE_FREE = 0.40        # walk fraction that stays under sound.step_speed (11.7*0.4 = 4.7 m/s)
-REGION_LEAD = 30.0       # head for the next circle this many seconds before the shrink starts
+REGION_LEAD = 40.0       # midgame: head for the next circle earlier, before the crowd (was 30)
 FIRE_DELAY = 0.08        # s between reading obs and the bullet actually leaving
 ACC_GAIN = 0.5           # fraction of the measured acceleration used when leading (sim: best of 5 variants)
 MAX_ACC = 58.5
@@ -366,7 +366,7 @@ class Planner:
 
 
 class Bot:
-    name = "survivor-v11a"
+    name = "survivor-v11c"
 
     def __init__(self, hello):
         seed = int(hello.get("seed", 0)) ^ (int(hello.get("slot", 0)) * 7919)
@@ -421,12 +421,10 @@ class Bot:
             d = min(d, 0.8 * 320.0)
             b = s["bearing"]
             self.marks.append((t - s["age"], x + d * math.cos(b), y + d * math.sin(b), k, s["dist"]))
-            danger = k in ("laser_charge", "laser", "gun", "lightning")
-            key = (0 if danger else 1, rank.get(s["dist"], 2), s["age"])
+            key = (rank.get(s["dist"], 2), s["age"])
             if best is None or key < best[0]:
                 best = (key, b)
-        # a near/mid laser charge or gunshot turns us at once; other sounds only if nothing fresher
-        if best and best[0][1] <= 1 and (best[0][0] == 0 or self.tb is None or self.tb[1] < t - 1.0):
+        if best and best[0][0] <= 1 and (self.tb is None or self.tb[1] < t - 1.0):
             self.tb = (best[1], t)
 
     def update_tracks(self, obs, t, x, y):
@@ -529,12 +527,6 @@ class Bot:
             if best:
                 return best
         return None
-
-    def find_cover_cached(self, x, y, z, threats, rc, rr, deadline, tick):
-        if self.cover is None or tick - self.cover[0] >= 6:
-            self.cover = (tick, self.find_cover(x, y, z, threats, rc, rr, deadline))
-        cv = self.cover[1]
-        return cv is not None and math.dist(cv, (x, y)) < 20
 
     def pick_nest(self, x, y, rc, rr):
         best, bs = None, 1e18
@@ -723,10 +715,7 @@ class Bot:
             urgent = True
             if VARIANT == "max":
                 group = weak = outgunned = False          # never retreat
-            # an enemy laser that just fired needs ~2.4 s to fire again -> push in during that window
-            window = any(t - self.beam_t.get(r[2]["id"], -99.0) < 1.5 for r in clear_close
-                         if "laser" in (r[2].get("weapons") or []))
-            close_in = outgunned and (d < 100 or (window and d < 170)) and not self.healing and hpr > 0.4
+            close_in = VARIANT == "fight" and outgunned and d < 100 and not self.healing and hpr > 0.4
             if close_in:
                 outgunned = False                         # rush the laser user: up close our gun hits, it charges at half speed
             if group or self.healing or weak or outgunned:
@@ -741,13 +730,6 @@ class Bot:
                 else:
                     sp = RETREAT_DIST
                     mv = self.radial_strafe(d, rate, bearing, sp)
-            elif (li is not None and weapons[li]["cooldown"] > 0.6 and weapons[li].get("charge", 0) <= 0
-                  and not close_in and self.find_cover_cached(x, y, z, threat_pos, rc, rr, deadline, tick)):
-                # peek-and-hide: our laser just fired (1.65 s cooldown) -> step out of sight, pre-charge
-                # behind cover, peek out again (shoot() releases once lined up)
-                cv = self.cover[1]
-                mode, goal = "peek-hide", cv
-                mv = self.go_to(x, y, z, cv, tick, deadline) if math.dist(cv, (x, y)) > 2 else (0.0, 0.0)
             else:
                 mode = "duel"
                 # with a laser, stay far: gun bots miss at 140 m, our beam does not
@@ -860,15 +842,10 @@ class Bot:
                     aim = (math.atan2(tp[1] - y, tp[0] - x), 0.0)
                 elif self.tb and t - self.tb[1] < 4.0:
                     aim = (self.tb[0], 0.0)
-                elif t < 2.5:
-                    aim = (wrap(cur[0] + 1.2), 0.0)                    # opening spin: see lasers lying around us
-                elif move[0] or move[1]:
-                    # v11: keep scanning while walking.  Vision is a 120 deg cone (only 45 m all round), so
-                    # looking where we walk leaves 240 deg blind; a +-120 deg sweep covers everything
-                    # every ~4 s and the torso (4 rad/s) turns independently of the legs.
-                    aim = (wrap(math.atan2(move[1], move[0]) + 2.1 * math.sin(t * 1.6)), 0.0)
+                elif (move[0] or move[1]) and mode in ("zone", "loot", "nest", "cubes", "drop", "hunt", "rush", "chase"):
+                    aim = (math.atan2(move[1], move[0]), 0.0)
                 else:
-                    aim = (wrap(cur[0] + 0.35), 0.0)                    # standing: slow full circle
+                    aim = (wrap(tick * 0.12), 0.0)
         if aim is not None:
             act["aim"] = [aim[0], aim[1]]
         if fire[0] or fire[1]:
@@ -904,6 +881,10 @@ class Bot:
         if not inside:
             return "zone", rp, self.go_to(x, y, z, rp, tick, deadline), None
         if self.healing:
+            return "heal", None, (0.0, 0.0), None
+        # midgame: top up before the next rotation (regen 45 hp/s after 5 s quiet) instead of walking in hurt
+        zn = obs["zone"]
+        if hpr < 0.7 and 35 < zn["shrink_start"] - t < 75 and t - self.last_mech_seen > 5 and t - self.last_dmg > 3:
             return "heal", None, (0.0, 0.0), None
         have_free = any(w is None for w in weapons)
         # 1) weapon loot by triangle preference
@@ -992,10 +973,14 @@ class Bot:
                 if ms:
                     mk = max(ms, key=lambda m: m[0])
                     tgt = (mk[1], mk[2])
+            # midgame: default = halfway between the centre and us, not the centre where everyone converges
+            dc = math.hypot(x - rc[0], y - rc[1])
+            k_ = min(1.0, 0.5 * rr / dc) if dc > 1 else 0.0
+            mid = (rc[0] + (x - rc[0]) * k_, rc[1] + (y - rc[1]) * k_)
             if tgt is None:
-                tgt = (rc[0], rc[1])
+                tgt = mid
             if math.hypot(tgt[0] - rc[0], tgt[1] - rc[1]) > rr:
-                tgt = (rc[0], rc[1])
+                tgt = mid
             if math.hypot(tgt[0] - x, tgt[1] - y) > 25:
                 return "hunt", tgt, self.go_to(x, y, z, tgt, tick, deadline), None
         # 6) tactical nest (low exposure spot beside a building), then hold
