@@ -663,8 +663,10 @@ class Bot:
                 max_rush = 60.0 if (STYLE == "hide" and t < 75) else 200.0
                 if dp_ < max_rush and (not clear_close or dp_ < 30) and (me["in_zone"] or dp_ < 40):
                     rush = (p_, dp_)
-        outgunned = li is None and (any("laser" in (r[2].get("weapons") or []) for r in clear_close)
-                                    or t - self.laser_threat_t < 2.5)
+        laser_foes = [r for r in clear_close if "laser" in (r[2].get("weapons") or [])]
+        # an enemy laser needs ~2.4 s (1.65 cooldown + 0.75 charge) after firing: that is our window
+        window = bool(laser_foes) and all(t - self.beam_t.get(r[2]["id"], -99.0) < 1.5 for r in laser_foes)
+        outgunned = li is None and not window and (bool(laser_foes) or t - self.laser_threat_t < 2.5)
         if rush is not None and not dg:
             p_, dp_ = rush
             if dp_ < self.pick_r and abs(p_["pos"][2] - z) < 4:
