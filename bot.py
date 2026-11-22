@@ -31,13 +31,19 @@ CUBE_CAP = 10
 #   "hide": never take long walks early; hiding spot must be within NEST_RANGE; quiet laser grabs only
 #   "hunt": play like the built-in bots: grab a laser, then go find fights; retreat only when nearly dead
 STYLE = "hunt"
+# ---- v8: hideouts ----
+# hideouts.json (made offline by precompute_hideouts.py, the map never changes): every candidate
+# spot with the number of open-ground positions within 200 m that can see a mech standing there.
+# Typical spot: 80+.  Best spots: 0-10.  We go to the least-seen spot inside the next zone circle.
+BUNKER = True
+DIST_COST = 0.03           # exposure points per metre of travel when choosing a hideout
 NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
 RUSH_UNTIL = 90.0        # early game: go get a laser
 
 # exact upgrade ids (order = priority); anything else falls back to the fuzzy list
-UPGRADE_PRIORITY = ["laser_damage", "laser_charge", "plating", "armor", "nanites", "gyros", "gun_rate", "gun_damage", "sensors"]
+UPGRADE_PRIORITY = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "sensors"]
 FUZZY = ["armor", "plat", "hull", "nano", "regen", "gun_rate", "gun_dam", "sensor"]
 # evidence (recorded match): built-in bots grab a laser in the first seconds and snipe at ~150 m.
 # so: laser always first, lightning second (it shorts lasers up close), never a mortar
@@ -126,6 +132,7 @@ class World:
         self.step, self.nx, self.ny = 1.0, 0, 0
         self.nav, self.navw, self.navh = None, 0, 0
         self.nests = []
+        self.hideouts = []
         try:
             with open(os.path.join(map_dir, "v2", "world.json")) as f:
                 w = json.load(f)
@@ -133,9 +140,11 @@ class World:
             self._load_terrain(map_dir, w)
             self._build_nav()
             self._build_nests(random.Random(seed))
+            self._components()
+            self._load_hideouts()
         except Exception as e:
             mf.log("world init problem:", repr(e))
-        mf.log(f"world: prisms={len(self.prisms)} nav={'y' if self.nav else 'n'} nests={len(self.nests)} {time.perf_counter()-t0:.2f}s")
+        mf.log(f"world: prisms={len(self.prisms)} nav={'y' if self.nav else 'n'} nests={len(self.nests)} hideouts={len(self.hideouts)} {time.perf_counter()-t0:.2f}s")
 
     # ----- loading -----
     def _load_prisms(self, w):
@@ -200,6 +209,64 @@ class World:
             if self.hit(a[0] + dx * f, a[1] + dy * f, z, z):
                 return False
         return True
+
+    def top_at(self, x, y, z):
+        """Highest top of the solids standing in our way at (x, y) for a mech whose feet are at z."""
+        best = None
+        for i in self.grid.get((int(x // self.CELL), int(y // self.CELL)), ()):
+            base, top, ring, holes, x0, y0, x1, y1, _k = self.prisms[i]
+            if base > z + 9.0 or top < z + 1.2 or x < x0 or x > x1 or y < y0 or y > y1:
+                continue
+            if _pip(x, y, ring) and not any(_pip(x, y, h) for h in holes):
+                best = top if best is None else max(best, top)
+        return best
+
+    def _components(self):
+        self.comp = None
+        if self.nav is None:
+            return
+        w, h = self.navw, self.navh
+        comp = [0] * (w * h)
+        sizes = {}
+        label = 0
+        nav = self.nav
+        for start in range(w * h):
+            if nav[start] or comp[start]:
+                continue
+            label += 1
+            comp[start] = label
+            stack = [start]
+            n = 0
+            while stack:
+                k = stack.pop()
+                n += 1
+                cx, cy = k % w, k // w
+                for nb in ((k - 1) if cx > 0 else -1, (k + 1) if cx < w - 1 else -1,
+                           (k - w) if cy > 0 else -1, (k + w) if cy < h - 1 else -1):
+                    if nb >= 0 and not nav[nb] and not comp[nb]:
+                        comp[nb] = label
+                        stack.append(nb)
+            sizes[label] = n
+        self.comp = comp
+        self.main_comp = max(sizes, key=sizes.get) if sizes else 0
+
+    def on_foot(self, x, y):
+        if self.comp is None:
+            return True
+        cx, cy = self.cell(x, y)
+        return self.comp[cy * self.navw + cx] == self.main_comp
+
+    def _load_hideouts(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hideouts.json")
+        try:
+            with open(path) as f:
+                rows = json.load(f)
+            # keep the reasonably hidden ones: x, y, z, seen, near, shot, roof
+            self.hideouts = [{"id": i, "spot": (r[0], r[1], r[2]), "seen": r[3], "roof": bool(r[6]),
+                              "foot": (not r[6]) and self.on_foot(r[0], r[1])}
+                             for i, r in enumerate(rows) if r[3] <= 60]
+        except Exception as e:
+            mf.log("hideouts not loaded:", repr(e))
 
     def walk_blocked(self, x, y, z):
         return self.hit(x, y, z + 1.2, z + 9.0)
@@ -387,6 +454,13 @@ class Bot:
         self.beam_t = {}             # enemy id -> time of its last laser beam
         self.laser_threat_t = -99.0  # last time a laser was charging at us / hit us
         self.last_mech_seen = -99.0
+        self.bunker = None          # chosen courtyard dict
+        self.bunker_fail = {}       # court id -> failed climbs
+        self.climb_t0 = None
+        self.climb_top = None
+        self.exit_from = None
+        self.direct = False
+        self.fail_areas = {}
         cfg = hello.get("config", {})
         self.pick_r = cfg.get("loot", {}).get("pickup_radius", 4.0) - 0.6
 
@@ -663,11 +737,19 @@ class Bot:
                 max_rush = 60.0 if (STYLE == "hide" and t < 75) else 200.0
                 if dp_ < max_rush and (not clear_close or dp_ < 30) and (me["in_zone"] or dp_ < 40):
                     rush = (p_, dp_)
-        laser_foes = [r for r in clear_close if "laser" in (r[2].get("weapons") or [])]
-        # an enemy laser needs ~2.4 s (1.65 cooldown + 0.75 charge) after firing: that is our window
-        window = bool(laser_foes) and all(t - self.beam_t.get(r[2]["id"], -99.0) < 1.5 for r in laser_foes)
-        outgunned = li is None and not window and (bool(laser_foes) or t - self.laser_threat_t < 2.5)
-        if rush is not None and not dg:
+        outgunned = li is None and (any("laser" in (r[2].get("weapons") or []) for r in clear_close)
+                                    or t - self.laser_threat_t < 2.5)
+        # ---- v8: courtyard bunker overrides travel and fights (we still shoot back while moving) ----
+        bunker = self.choose_bunker(obs, x, y, rc, rr)
+        bmode = None
+        if bunker is not None and not (rush is not None and rush[1] < 30):
+            bmode, bmv, bdirect = self.bunker_move(bunker, me, x, y, z, t, tick, deadline)
+        if bmode is not None:
+            mode, goal, mv = bmode, bunker["spot"], bmv
+            urgent = bmode not in ("bunker", "bunker-in")
+            if bdirect and not self.climb_assist(act, me, x, y, z, mv):
+                mode, mv = "bunker-charge", (0.0, 0.0)
+        elif rush is not None and not dg:
             p_, dp_ = rush
             if dp_ < self.pick_r and abs(p_["pos"][2] - z) < 4:
                 act["take"] = p_["id"]
@@ -727,7 +809,7 @@ class Bot:
                 urgent = urgent or mode == "zone"
 
         # ---------- apply movement ----------
-        if mode in ("hold", "crate", "heal", "take") or (mv[0] == 0 and mv[1] == 0):
+        if mode in ("hold", "crate", "heal", "take", "bunker", "bunker-charge") or (mv[0] == 0 and mv[1] == 0):
             move = [0.0, 0.0]
         else:
             sc_move = 1.0 if urgent else (0.75 if mode == "drop" else NOISE_FREE)
@@ -737,11 +819,11 @@ class Bot:
             act["boost"] = True
 
         spd = math.hypot(me["vel"][0], me["vel"][1])
-        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt") and (move[0] or move[1]) and spd < 1.5:
+        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt", "bunker-go") and (move[0] or move[1]) and spd < 1.5:
             self.stuck += 1
         else:
             self.stuck = max(0, self.stuck - 2) if self.stuck < 20 else 0
-        if 6 <= self.stuck < 20:
+        if 6 <= self.stuck < 20 and not mode.startswith("bunker"):
             act["jump"] = True
             act["boost"] = True
             if self.stuck % 12 == 0:
@@ -757,7 +839,7 @@ class Bot:
             tc = (m["pos"][0], m["pos"][1], m["pos"][2] + ch)
             aim, fire = self.shoot(me, weapons, gi, li, ni, mi, muzzle, cur, tc, m["vel"], tr["acc"], d, True, tick, 170.0)
             aimed_at = tc
-        elif farm is not None and t - self.last_dmg > 1.0:
+        elif farm is not None:
             kind, p, v, ch, d = farm
             tc = (p[0], p[1], p[2] + ch)
             aim, fire = self.shoot(me, weapons, gi, None, None, None, muzzle, cur, tc, v, [0.0, 0.0], d, True, tick, 60.0)
@@ -794,8 +876,6 @@ class Bot:
                     aim = (math.atan2(tp[1] - y, tp[0] - x), 0.0)
                 elif self.tb and t - self.tb[1] < 4.0:
                     aim = (self.tb[0], 0.0)
-                elif li is None and not ranked and t < 150:
-                    aim = (wrap(cur[0] + 1.2), 0.0)        # full-speed spin: lasers lying beside us show up
                 elif (move[0] or move[1]) and mode in ("zone", "loot", "nest", "cubes", "drop", "hunt", "rush"):
                     aim = (math.atan2(move[1], move[0]), 0.0)
                 else:
@@ -821,6 +901,99 @@ class Bot:
             mf.draw.point([mk[1], mk[2], z], "#ffd060", 3)
             mf.draw.text(f"{mk[3]} {mk[4]}: {SOUND_WEAPON.get(mk[3], '?')}", [mk[1], mk[2], z + 3], "#ffd060")
         return act
+
+    # ------------------------------------------------------------ v8 hideouts
+    def at_spot(self, c, x, y, z):
+        sx, sy, sz = c["spot"]
+        return math.hypot(sx - x, sy - y) < 2.5 and abs(z - sz) < 2.5
+
+    def choose_bunker(self, obs, x, y, rc, rr):
+        if not BUNKER or not self.world.hideouts:
+            return None
+        zn = obs["zone"]
+        nc, nr = zn["next_center"], zn["next_radius"]
+        def score(c):
+            sx, sy, _ = c["spot"]
+            if math.hypot(sx - rc[0], sy - rc[1]) > rr - 5 or math.hypot(sx - nc[0], sy - nc[1]) > nr - 12:
+                return None
+            pen = 0.0 if c["foot"] else 12.0
+            for (fx, fy), n in self.fail_areas.items():
+                if math.hypot(sx - fx, sy - fy) < 25:
+                    pen += 30.0 * n
+            return c["seen"] + pen + DIST_COST * math.hypot(sx - x, sy - y)
+        cur = score(self.bunker) if self.bunker is not None else None
+        best, bs = None, 1e18
+        for c in self.world.hideouts:
+            v = score(c)
+            if v is not None and v < bs:
+                best, bs = c, v
+        if best is None:
+            return None if cur is None else self.bunker
+        if cur is not None and bs > cur - 15.0:      # commit: only switch for a clearly better spot
+            return self.bunker
+        if best is not self.bunker:
+            self.bunker = best
+            self.climb_t0 = None
+            self.direct = False
+        return best
+
+    def bunker_move(self, c, me, x, y, z, t, tick, deadline):
+        """Returns (mode, mv, direct).  direct=True: walk straight at it and climb whatever is in the way."""
+        sx, sy, sz = c["spot"]
+        d = math.hypot(sx - x, sy - y)
+        if self.at_spot(c, x, y, z):
+            self.climb_t0 = None
+            return "bunker", (0.0, 0.0), False
+        elevated = z - self.world.ground(x, y) > 4.0 and abs(z - sz) > 2.5     # on the wrong roof
+        pl = self.plan
+        path_done = (pl is not None and not pl.active and pl.path and pl.i >= len(pl.path) - 2
+                     and pl.goal is not None and math.hypot(pl.goal[0] - sx, pl.goal[1] - sy) < 3)
+        if not getattr(self, "direct", False):
+            if (elevated or d < (6 if c["foot"] else 14) or (c["roof"] and d < 35) or self.stuck >= 15
+                    or (pl is not None and pl.failed) or (path_done and d > 4)):
+                self.direct = True
+        # progress check: bouncing in place without getting closer -> go straight and climb
+        pg = getattr(self, "prog", None)
+        if pg is None or pg[2] is not c:
+            self.prog = (t, d, c)
+        elif t - pg[0] > 4.0:
+            if d > pg[1] - 3.0:
+                self.direct = True
+            self.prog = (t, d, c)
+        if not self.direct:
+            self.climb_t0 = None
+            return "bunker-go", self.go_to(x, y, z, (sx, sy), tick, deadline), False
+        if self.climb_t0 is None:
+            self.climb_t0 = t
+        elif t - self.climb_t0 > 12.0:             # cannot get there: penalise it and pick again
+            self.bunker_fail[c["id"]] = self.bunker_fail.get(c["id"], 0) + 1
+            key = (round(sx, -1), round(sy, -1))
+            self.fail_areas[key] = self.fail_areas.get(key, 0) + 1
+            self.climb_t0 = None
+            self.direct = False
+            self.bunker = None
+        return "bunker-climb", norm2(sx - x, sy - y), True
+
+    def climb_assist(self, act, me, x, y, z, mv):
+        """Jump + jet over the solid in front of us; returns False if we must wait for energy."""
+        if mv[0] == 0 and mv[1] == 0:
+            return True
+        px, py = x + mv[0] * 3.5, y + mv[1] * 3.5
+        top = self.world.top_at(px, py, z)
+        if me["grounded"]:
+            # on the ground: only the wall right in front of us counts (forget older, taller ones)
+            self.climb_top = top if (top is not None and top - z < 50) else None
+        elif top is not None and top - z < 50 and (self.climb_top is None or top > self.climb_top):
+            self.climb_top = top
+        if self.climb_top is not None and z < self.climb_top + 2.0:
+            if me["grounded"]:
+                need = min(95.0, 1.6 * (self.climb_top - z) + 10.0)
+                if me["energy"] < need:
+                    return False
+                act["jump"] = True
+            else:
+                act["boost"] = True
+        return True
 
     # ------------------------------------------------------------ helpers used by act()
     def radial_strafe(self, d, rate, bearing, setpoint):
@@ -879,16 +1052,6 @@ class Bot:
             if cs:
                 c = min(cs, key=lambda c: math.dist(c["pos"][:2], (x, y)))
                 return "cubes", c["pos"], self.go_to(x, y, z, c["pos"], tick, deadline), None
-        # 4b) no laser yet: crates drop a weapon half the time -> shoot them early
-        if "laser" not in slot_of and t < 150 and t - self.last_dmg > 2.0 and any(w and w["kind"] == "gun" for w in weapons):
-            cr = [(math.dist(c["pos"][:2], (x, y)), c) for c in obs.get("crates", [])
-                  if math.hypot(c["pos"][0] - rc[0], c["pos"][1] - rc[1]) < rr and abs(c["pos"][2] - z) < 6]
-            cr.sort(key=lambda a: a[0])
-            for d, c in cr[:3]:
-                if d < 45 and self.world.los((x, y, z + 8), (c["pos"][0], c["pos"][1], c["pos"][2] + 1.5)):
-                    return "crate", None, (0.0, 0.0), ("crate", c["pos"], [0, 0, 0], 1.5, d)
-            if cr and cr[0][0] < 90:
-                return "loot", cr[0][1]["pos"], self.go_to(x, y, z, cr[0][1]["pos"], tick, deadline), None
         # 4) NPC drones (only healthy) and 5) crates, both with the gun
         quiet = not any(m[3] in ("gun", "laser", "lightning", "mortar") and m[4] == "near" for m in self.marks)
         if hpr > 0.8 and quiet and t - self.last_mech_seen > 8.0 and any(w and w["kind"] == "gun" for w in weapons):
