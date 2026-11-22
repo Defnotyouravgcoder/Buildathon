@@ -27,11 +27,17 @@ RETREAT_DIST = 120.0
 SOFT_BUDGET = 0.030      # seconds of compute per decision we allow ourselves
 PLAN_BUDGET = 0.010
 CUBE_CAP = 10
+LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
+LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
+RUSH_UNTIL = 90.0        # early game: go get a laser
 
 # exact upgrade ids (order = priority); anything else falls back to the fuzzy list
 UPGRADE_PRIORITY = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "sensors"]
 FUZZY = ["armor", "plat", "hull", "nano", "regen", "gun_rate", "gun_dam", "sensor"]
-BEATS = {"laser": "mortar", "mortar": "lightning", "lightning": "laser"}   # key beats value
+# evidence (recorded match): built-in bots grab a laser in the first seconds and snipe at ~150 m.
+# so: laser always first, lightning second (it shorts lasers up close), never a mortar
+# (mortar holders take +60% from lasers and the shell is easy to dodge).
+WEAPON_PREF = {"laser": 3.0, "lightning": 1.0, "mortar": -5.0}
 DIST_MID = {"near": 35.0, "mid": 100.0, "far": 220.0}
 SOUND_WEAPON = {"gun": "gun/NPC-free", "laser": "laser holder", "laser_charge": "laser holder charging",
                 "lightning": "lightning holder", "mortar": "mortar holder", "step": "mech walking",
@@ -372,6 +378,12 @@ class Bot:
         self.side_until = 0.0
         self.laser_start = None
         self.last_pos = None
+        self.full_since = None       # match time our laser reached full charge
+        self.beam_t = {}             # enemy id -> time of its last laser beam
+        self.laser_threat_t = -99.0  # last time a laser was charging at us / hit us
+        self.last_mech_seen = -99.0
+        cfg = hello.get("config", {})
+        self.pick_r = cfg.get("loot", {}).get("pickup_radius", 4.0) - 0.6
 
     # ------------------------------------------------------------ bookkeeping
     def read_events(self, obs, t, x, y):
@@ -381,8 +393,13 @@ class Bot:
                 self.bad.add(ev["id"])
             elif ty == "damaged":
                 self.last_dmg = t
+                if ev.get("weapon") == "laser":
+                    self.laser_threat_t = t
                 if ev.get("bearing") is not None:
                     self.tb = (ev["bearing"], t)
+        for b in obs.get("beams", []):
+            if b.get("kind") == "laser":
+                self.beam_t[b["by"]] = t - b.get("age", 0.0)
         self.marks = [m for m in self.marks if t - m[0] < 4.0]
         rank = {"near": 0, "mid": 1, "far": 2}
         best = None
@@ -420,14 +437,7 @@ class Bot:
                               "weapons": m.get("weapons", [])}
 
     def weapon_pref(self, t):
-        pref = {"laser": 0.0, "mortar": -0.01, "lightning": -0.02}
-        for tr in self.tracks.values():
-            if t - tr["t"] < 12:
-                for w in tr["weapons"]:
-                    for y_, x_ in BEATS.items():
-                        if x_ == w:
-                            pref[y_] += 1.0
-        return pref
+        return dict(WEAPON_PREF)
 
     def pick_upgrade(self, offer):
         ids = [c["id"].lower() for c in offer["choices"]]
@@ -558,6 +568,7 @@ class Bot:
                 s = rx * -uy + ry * ux
                 if along > 0 and abs(s) < 6.0 and math.hypot(rx, ry) < 290:
                     sg = 1 if s >= 0 else -1
+                    self.laser_threat_t = obs["t"]
                     if abs(s) < 0.5:
                         sg = self.rng.choice((-1, 1))
                     return (-uy * sg, ux * sg), energy > 25
@@ -593,6 +604,8 @@ class Bot:
 
         # ---------- rank enemies ----------
         mech_list = [m for m in obs["mechs"] if m["kind"] == "mech"]
+        if mech_list:
+            self.last_mech_seen = t
         npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
         mech_list.sort(key=lambda m: math.dist(m["pos"][:2], (x, y)))
         ranked = []
@@ -634,7 +647,31 @@ class Bot:
             self.side = self.rng.choice((-1, 1))
             self.side_until = t + self.rng.uniform(0.6, 1.6)
 
-        if dg:
+        # ---- laser rush: the built-in bots win with lasers, so get one first ----
+        rush = None
+        if li is None and (t < RUSH_UNTIL or any(w is None for w in weapons) or mi is not None):
+            lasers = [p for p in obs.get("pickups", []) if p["kind"] == "laser" and p["id"] not in self.bad
+                      and abs(p["pos"][2] - z) < 25]
+            if lasers:
+                p_ = min(lasers, key=lambda p: math.dist(p["pos"][:2], (x, y)))
+                dp_ = math.dist(p_["pos"][:2], (x, y))
+                if dp_ < 200 and (not clear_close or dp_ < 30) and (me["in_zone"] or dp_ < 40):
+                    rush = (p_, dp_)
+        outgunned = li is None and (any("laser" in (r[2].get("weapons") or []) for r in clear_close)
+                                    or t - self.laser_threat_t < 2.5)
+        if rush is not None and not dg:
+            p_, dp_ = rush
+            if dp_ < self.pick_r and abs(p_["pos"][2] - z) < 4:
+                act["take"] = p_["id"]
+                if not any(w is None for w in weapons):
+                    act["drop"] = mi if mi is not None else (ni if ni is not None else 1)
+                mode, goal, mv = "take", p_["pos"], (0.0, 0.0)
+            else:
+                mode, goal = "rush", p_["pos"]
+                mv = self.go_to(x, y, z, p_["pos"], tick, deadline)
+                urgent = True
+                boost = dp_ > 25 and me["energy"] > 35 and not clear_close
+        elif dg:
             mode, mv, urgent, boost = "dodge", dg, True, dg_boost
         elif clear_close:
             sc_, d, m, clear, ch = ranked[0] if ranked[0][3] else clear_close[0]
@@ -645,7 +682,7 @@ class Bot:
             weak = hpr < 0.6
             group = len(clear_close) >= 2
             urgent = True
-            if group or self.healing or weak:
+            if group or self.healing or weak or outgunned:
                 mode = "retreat"
                 if self.cover is None or tick - self.cover[0] >= 6:
                     self.cover = (tick, self.find_cover(x, y, z, threat_pos, rc, rr, deadline))
@@ -659,7 +696,8 @@ class Bot:
                     mv = self.radial_strafe(d, rate, bearing, sp)
             else:
                 mode = "duel"
-                mv = self.radial_strafe(d, rate, bearing, DUEL_DIST)
+                # with a laser, stay far: gun bots miss at 140 m, our beam does not
+                mv = self.radial_strafe(d, rate, bearing, 140.0 if li is not None else DUEL_DIST)
             if not me["in_zone"]:
                 bx, by = self.steer(x, y, z, rp[0], rp[1])
                 mv = norm2(mv[0] + bx, mv[1] + by)
@@ -680,7 +718,7 @@ class Bot:
                 urgent = urgent or mode == "zone"
 
         # ---------- apply movement ----------
-        if mode in ("hold", "crate", "heal") or (mv[0] == 0 and mv[1] == 0):
+        if mode in ("hold", "crate", "heal", "take") or (mv[0] == 0 and mv[1] == 0):
             move = [0.0, 0.0]
         else:
             sc_move = 1.0 if urgent else (0.75 if mode == "drop" else NOISE_FREE)
@@ -690,7 +728,7 @@ class Bot:
             act["boost"] = True
 
         spd = math.hypot(me["vel"][0], me["vel"][1])
-        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop") and (move[0] or move[1]) and spd < 1.5:
+        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush") and (move[0] or move[1]) and spd < 1.5:
             self.stuck += 1
         else:
             self.stuck = max(0, self.stuck - 2) if self.stuck < 20 else 0
@@ -723,6 +761,24 @@ class Bot:
                 tc = (m["pos"][0], m["pos"][1], m["pos"][2] + ch)
                 aim, fire = self.shoot(me, weapons, None, None, None, mi, muzzle, cur, tc, m["vel"], tr["acc"], d, False, tick, 170.0)
                 aimed_at = tc
+            if aim is None and li is not None and (hidden_vis or weapons[li].get("charge", 0) > 0):
+                lw = weapons[li]
+                charge = lw.get("charge", 0.0)
+                t_now = tick * 0.05
+                if charge <= 0:
+                    self.full_since = None
+                elif charge >= lw["stats"].get("charge", 0.75) * LASER_FULL and self.full_since is None:
+                    self.full_since = t_now
+                if hidden_vis:
+                    tp = hidden_vis[0][2]["pos"]
+                    aim = direct_aim(muzzle, (tp[0], tp[1], tp[2] + hidden_vis[0][4]))
+                else:
+                    aim = (cur[0], cur[1])
+                held = t_now - self.full_since if self.full_since is not None else 0.0
+                if charge > 0:
+                    fire[li] = held < LASER_SAFE_HOLD
+                elif lw["cooldown"] <= 0.05 and hidden_vis and hidden_vis[0][1] < 220:
+                    fire[li] = True
             if aim is None:
                 if hidden_vis:
                     tp = hidden_vis[0][2]["pos"]
@@ -776,7 +832,7 @@ class Bot:
         cands = []
         for p in obs.get("pickups", []):
             k = p["kind"]
-            if p["id"] in self.bad or k not in pref or k in slot_of:
+            if p["id"] in self.bad or k not in pref or k in slot_of or pref[k] < 0:
                 continue
             if have_free or (cur_other is not None and pref[k] > pref.get(cur_other, -9) + 0.5
                              and not (cur_other == "laser" and weapons[slot_of["laser"]].get("charge", 0) > 0)):
@@ -814,7 +870,7 @@ class Bot:
                 return "cubes", c["pos"], self.go_to(x, y, z, c["pos"], tick, deadline), None
         # 4) NPC drones (only healthy) and 5) crates, both with the gun
         quiet = not any(m[3] in ("gun", "laser", "lightning", "mortar") and m[4] == "near" for m in self.marks)
-        if hpr > 0.8 and quiet and any(w and w["kind"] == "gun" for w in weapons):
+        if hpr > 0.8 and quiet and t - self.last_mech_seen > 8.0 and any(w and w["kind"] == "gun" for w in weapons):
             ns = [(math.dist(n["pos"][:2], (x, y)), n) for n in npcs]
             ns = [(d, n) for d, n in ns if d < 45 and self.world.los((x, y, z + 8), (n["pos"][0], n["pos"][1], n["pos"][2] + 1.7))]
             if ns:
@@ -837,24 +893,29 @@ class Bot:
         """Choose weapon + aim for target centre tc. Returns (aim, fire[2])."""
         fire = [False, False]
         aim = None
-        # laser: only released when lined up (or before the 2 s auto-fire)
+        # laser: charge fully, let go only when lined up; never let the server auto-fire it
         if li is not None:
             lw = weapons[li]
             charge = lw.get("charge", 0.0)
-            if charge > 0 or (lw["cooldown"] <= 0.05 and clear and d <= 220):
-                aim = direct_aim(muzzle, tc)
-                thr = clampf(math.atan2(2.0, d), 0.01, 0.1)
+            full = lw["stats"].get("charge", 0.75)
+            t_now = tick * 0.05
+            if charge <= 0:
+                self.full_since = None
+            elif charge >= full * LASER_FULL and self.full_since is None:
+                self.full_since = t_now
+            if charge > 0 or (lw["cooldown"] <= 0.05 and clear and d <= 250):
+                # hitscan, fired at release (next decision): aim where it will be in ~0.1 s
+                lt = (tc[0] + vel[0] * 0.1, tc[1] + vel[1] * 0.1, tc[2])
+                aim = direct_aim(muzzle, lt)
+                thr = clampf(math.atan2(1.6, d), 0.006, 0.06)
                 err = max(abs(wrap(aim[0] - cur[0])), abs(aim[1] - cur[1]))
                 if charge > 0:
-                    held_ticks = tick - (self.laser_start or tick)
-                    aligned = err < thr
-                    release = (aligned and charge >= 0.5) or held_ticks >= 24 or not clear
+                    held = t_now - self.full_since if self.full_since is not None else 0.0
+                    ready = charge >= full * LASER_FULL
+                    release = (clear and ready and err < thr) or held >= LASER_SAFE_HOLD
                     fire[li] = not release
-                    if release:
-                        self.laser_start = None
                 elif err < 0.35:
                     fire[li] = True
-                    self.laser_start = tick
                 if fire[li] or charge > 0:
                     return aim, fire
         # mortar: lob at 30-200 m, never under 30 m (7 m splash hurts me at 50%)
@@ -871,7 +932,7 @@ class Bot:
         if gi is not None:
             gs = weapons[gi]
             aim = lead_aim(muzzle, tc, vel, acc, gs["stats"].get("speed", 252.0))
-            thr = clampf(math.atan2(2.2, d), 0.015, 0.12)
+            thr = clampf(math.atan2(3.0, d), 0.02, 0.15)
             err = max(abs(wrap(aim[0] - cur[0])), abs(aim[1] - cur[1]))
             rng = min(gs["stats"].get("range", 230.0), gun_range)
             if clear and err < thr and d <= rng and gs.get("ammo", 1) > 0 and gs.get("reload", 0) <= 0:
