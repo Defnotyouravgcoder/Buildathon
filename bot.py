@@ -18,7 +18,7 @@ import targeting as T
 
 TAU = 2 * math.pi
 NOISE_FREE = 0.40        # walk fraction that stays under sound.step_speed (11.7*0.4 = 4.7 m/s)
-REGION_LEAD = 40.0       # midgame: head for the next circle earlier, before the crowd (was 30)
+REGION_LEAD = 30.0       # head for the next circle this many seconds before the shrink starts
 FIRE_DELAY = 0.08        # s between reading obs and the bullet actually leaving
 ACC_GAIN = 0.5           # fraction of the measured acceleration used when leading (sim: best of 5 variants)
 MAX_ACC = 58.5
@@ -48,6 +48,11 @@ FUZZY = ["armor", "plat", "hull", "nano", "regen", "gun_rate", "gun_dam", "senso
 # so: laser always first, lightning second (it shorts lasers up close), never a mortar
 # (mortar holders take +60% from lasers and the shell is easy to dodge).
 WEAPON_PREF = {"laser": 3.0, "lightning": 1.0, "mortar": -5.0}
+# v13: late game (small circles, close fights) lightning is worth more than the laser:
+# ~240 dps within 45 m, chains, and every hit "shorts" an enemy laser for 2 s (most built-ins carry lasers)
+LATE_T = 230.0           # match time after which we count as late game
+LATE_R = 160.0           # ... or once the current circle radius is this small
+WEAPON_PREF_LATE = {"lightning": 3.0, "laser": 2.0, "mortar": -5.0}
 DIST_MID = {"near": 35.0, "mid": 100.0, "far": 220.0}
 SOUND_WEAPON = {"gun": "gun/NPC-free", "laser": "laser holder", "laser_charge": "laser holder charging",
                 "lightning": "lightning holder", "mortar": "mortar holder", "step": "mech walking",
@@ -366,7 +371,7 @@ class Planner:
 
 
 class Bot:
-    name = "survivor-v11c"
+    name = "survivor-v13"
 
     def __init__(self, hello):
         seed = int(hello.get("seed", 0)) ^ (int(hello.get("slot", 0)) * 7919)
@@ -447,7 +452,7 @@ class Bot:
                               "weapons": m.get("weapons", []), "pos": m["pos"], "kind": m["kind"]}
 
     def weapon_pref(self, t):
-        return dict(WEAPON_PREF)
+        return dict(WEAPON_PREF_LATE if getattr(self, "late", False) else WEAPON_PREF)
 
     def pick_upgrade(self, offer):
         ids = [c["id"].lower() for c in offer["choices"]]
@@ -677,14 +682,19 @@ class Bot:
             self.side_until = t + self.rng.uniform(0.6, 1.6)
 
         # ---- laser rush: the built-in bots win with lasers, so get one first ----
+        # ---- v13: early/mid game rush a laser, late game rush lightning ----
+        zr = obs["zone"]["radius"]
+        self.late = late = t >= LATE_T or zr <= LATE_R
+        want = "lightning" if late else "laser"
+        charging_now = li is not None and weapons[li].get("charge", 0) > 0
         rush = None
-        if li is None and (t < RUSH_UNTIL or any(w is None for w in weapons) or mi is not None):
-            lasers = [p for p in obs.get("pickups", []) if p["kind"] == "laser" and p["id"] not in self.bad
-                      and abs(p["pos"][2] - z) < 25]
-            if lasers:
-                p_ = min(lasers, key=lambda p: math.dist(p["pos"][:2], (x, y)))
+        if want not in slot_of and not charging_now and (late or t < RUSH_UNTIL or any(w is None for w in weapons) or mi is not None):
+            cands = [p for p in obs.get("pickups", []) if p["kind"] == want and p["id"] not in self.bad
+                     and abs(p["pos"][2] - z) < 25]
+            if cands:
+                p_ = min(cands, key=lambda p: math.dist(p["pos"][:2], (x, y)))
                 dp_ = math.dist(p_["pos"][:2], (x, y))
-                max_rush = 60.0 if (STYLE == "hide" and t < 75) else 200.0
+                max_rush = 70.0 if late else (60.0 if (STYLE == "hide" and t < 75) else 200.0)
                 if dp_ < max_rush and (not clear_close or dp_ < 30) and (me["in_zone"] or dp_ < 40):
                     rush = (p_, dp_)
         outgunned = li is None and (any("laser" in (r[2].get("weapons") or []) for r in clear_close)
@@ -694,7 +704,9 @@ class Bot:
             if dp_ < self.pick_r and abs(p_["pos"][2] - z) < 4:
                 act["take"] = p_["id"]
                 if not any(w is None for w in weapons):
-                    act["drop"] = mi if mi is not None else (ni if ni is not None else 1)
+                    # drop the weapon we want least: mortar, else the other special (laser late / lightning early)
+                    other = li if p_["kind"] == "lightning" else ni
+                    act["drop"] = mi if mi is not None else (other if other is not None else 1)
                 mode, goal, mv = "take", p_["pos"], (0.0, 0.0)
             else:
                 mode, goal = "rush", p_["pos"]
@@ -715,6 +727,8 @@ class Bot:
             urgent = True
             if VARIANT == "max":
                 group = weak = outgunned = False          # never retreat
+            if ni is not None and late:
+                outgunned = outgunned and d > 120             # far laser user: still hide; near: lightning wins
             close_in = VARIANT == "fight" and outgunned and d < 100 and not self.healing and hpr > 0.4
             if close_in:
                 outgunned = False                         # rush the laser user: up close our gun hits, it charges at half speed
@@ -739,6 +753,9 @@ class Bot:
                 elif close_in:
                     sp_ = 20.0
                     boost = me["energy"] > 30
+                elif ni is not None and (late or li is None):
+                    sp_ = 30.0                                  # get inside lightning range (45 m)
+                    boost = me["energy"] > 45 and d > 50
                 else:
                     sp_ = 140.0 if li is not None else DUEL_DIST
                 mv = self.radial_strafe(d, rate, bearing, sp_)
@@ -882,10 +899,6 @@ class Bot:
             return "zone", rp, self.go_to(x, y, z, rp, tick, deadline), None
         if self.healing:
             return "heal", None, (0.0, 0.0), None
-        # midgame: top up before the next rotation (regen 45 hp/s after 5 s quiet) instead of walking in hurt
-        zn = obs["zone"]
-        if hpr < 0.7 and 35 < zn["shrink_start"] - t < 75 and t - self.last_mech_seen > 5 and t - self.last_dmg > 3:
-            return "heal", None, (0.0, 0.0), None
         have_free = any(w is None for w in weapons)
         # 1) weapon loot by triangle preference
         pref = self.weapon_pref(t)
@@ -942,6 +955,13 @@ class Bot:
         else:  # max
             farm_ok = hpr > 0.3
             shoot_r, walk_r = 70.0, 90.0
+        if (getattr(self, "late", False) and "lightning" not in slot_of and hpr > 0.5
+                and t - self.last_mech_seen > 4.0 and any(w and w["kind"] == "gun" for w in weapons)):
+            cr = [(math.dist(c["pos"][:2], (x, y)), c) for c in obs.get("crates", [])
+                  if math.hypot(c["pos"][0] - rc[0], c["pos"][1] - rc[1]) < rr and abs(c["pos"][2] - z) < 6]
+            for d, c in sorted(cr, key=lambda a: a[0])[:3]:
+                if d < 45 and self.world.los((x, y, z + 8), (c["pos"][0], c["pos"][1], c["pos"][2] + 1.5)):
+                    return "crate", None, (0.0, 0.0), ("crate", c["pos"], [0, 0, 0], 1.5, d)
         if farm_ok and any(w and w["kind"] == "gun" for w in weapons):
             ns = [(math.dist(n["pos"][:2], (x, y)), n) for n in npcs]
             ns.sort(key=lambda a: a[0])
@@ -973,14 +993,10 @@ class Bot:
                 if ms:
                     mk = max(ms, key=lambda m: m[0])
                     tgt = (mk[1], mk[2])
-            # midgame: default = halfway between the centre and us, not the centre where everyone converges
-            dc = math.hypot(x - rc[0], y - rc[1])
-            k_ = min(1.0, 0.5 * rr / dc) if dc > 1 else 0.0
-            mid = (rc[0] + (x - rc[0]) * k_, rc[1] + (y - rc[1]) * k_)
             if tgt is None:
-                tgt = mid
+                tgt = (rc[0], rc[1])
             if math.hypot(tgt[0] - rc[0], tgt[1] - rc[1]) > rr:
-                tgt = mid
+                tgt = (rc[0], rc[1])
             if math.hypot(tgt[0] - x, tgt[1] - y) > 25:
                 return "hunt", tgt, self.go_to(x, y, z, tgt, tick, deadline), None
         # 6) tactical nest (low exposure spot beside a building), then hold
@@ -995,7 +1011,8 @@ class Bot:
         fire = [False, False]
         aim = None
         # laser: charge fully, let go only when lined up; never let the server auto-fire it
-        if li is not None:
+        # v13: inside lightning range, lightning (240 dps, shorts their laser) beats starting a new charge
+        if li is not None and not (ni is not None and d <= 42 and weapons[li].get("charge", 0.0) <= 0):
             lw = weapons[li]
             charge = lw.get("charge", 0.0)
             full = lw["stats"].get("charge", 0.75)
