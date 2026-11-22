@@ -37,7 +37,7 @@ LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server aut
 RUSH_UNTIL = 90.0        # early game: go get a laser
 
 # exact upgrade ids (order = priority); anything else falls back to the fuzzy list
-UPGRADE_PRIORITY = ["armor", "plating", "nanites", "gun_rate", "gun_damage", "sensors"]
+UPGRADE_PRIORITY = ["laser_damage", "laser_charge", "plating", "armor", "nanites", "gyros", "gun_rate", "gun_damage", "sensors"]
 FUZZY = ["armor", "plat", "hull", "nano", "regen", "gun_rate", "gun_dam", "sensor"]
 # evidence (recorded match): built-in bots grab a laser in the first seconds and snipe at ~150 m.
 # so: laser always first, lightning second (it shorts lasers up close), never a mortar
@@ -755,7 +755,7 @@ class Bot:
             tc = (m["pos"][0], m["pos"][1], m["pos"][2] + ch)
             aim, fire = self.shoot(me, weapons, gi, li, ni, mi, muzzle, cur, tc, m["vel"], tr["acc"], d, True, tick, 170.0)
             aimed_at = tc
-        elif farm is not None:
+        elif farm is not None and t - self.last_dmg > 1.0:
             kind, p, v, ch, d = farm
             tc = (p[0], p[1], p[2] + ch)
             aim, fire = self.shoot(me, weapons, gi, None, None, None, muzzle, cur, tc, v, [0.0, 0.0], d, True, tick, 60.0)
@@ -792,6 +792,8 @@ class Bot:
                     aim = (math.atan2(tp[1] - y, tp[0] - x), 0.0)
                 elif self.tb and t - self.tb[1] < 4.0:
                     aim = (self.tb[0], 0.0)
+                elif li is None and not ranked and t < 150:
+                    aim = (wrap(cur[0] + 1.2), 0.0)        # full-speed spin: lasers lying beside us show up
                 elif (move[0] or move[1]) and mode in ("zone", "loot", "nest", "cubes", "drop", "hunt", "rush"):
                     aim = (math.atan2(move[1], move[0]), 0.0)
                 else:
@@ -875,6 +877,16 @@ class Bot:
             if cs:
                 c = min(cs, key=lambda c: math.dist(c["pos"][:2], (x, y)))
                 return "cubes", c["pos"], self.go_to(x, y, z, c["pos"], tick, deadline), None
+        # 4b) no laser yet: crates drop a weapon half the time -> shoot them early
+        if "laser" not in slot_of and t < 150 and t - self.last_dmg > 2.0 and any(w and w["kind"] == "gun" for w in weapons):
+            cr = [(math.dist(c["pos"][:2], (x, y)), c) for c in obs.get("crates", [])
+                  if math.hypot(c["pos"][0] - rc[0], c["pos"][1] - rc[1]) < rr and abs(c["pos"][2] - z) < 6]
+            cr.sort(key=lambda a: a[0])
+            for d, c in cr[:3]:
+                if d < 45 and self.world.los((x, y, z + 8), (c["pos"][0], c["pos"][1], c["pos"][2] + 1.5)):
+                    return "crate", None, (0.0, 0.0), ("crate", c["pos"], [0, 0, 0], 1.5, d)
+            if cr and cr[0][0] < 90:
+                return "loot", cr[0][1]["pos"], self.go_to(x, y, z, cr[0][1]["pos"], tick, deadline), None
         # 4) NPC drones (only healthy) and 5) crates, both with the gun
         quiet = not any(m[3] in ("gun", "laser", "lightning", "mortar") and m[4] == "near" for m in self.marks)
         if hpr > 0.8 and quiet and t - self.last_mech_seen > 8.0 and any(w and w["kind"] == "gun" for w in weapons):
