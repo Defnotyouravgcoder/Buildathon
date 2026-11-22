@@ -36,11 +36,11 @@ STYLE = "hunt"
 #   "farm" : v5 + much more drones / crates / cubes / supply drops (cubes = +4% HP & dmg + upgrades)
 #   "fight": v5 + duck behind walls from charging lasers, rush laser users up close, third-party, heal breaks
 VARIANT = "fight"
-# ---- v16 ----
-DUEL_CLOSE = 30.0        # duel distance for everyone: inside lightning range, gun hits most shots
-CLOSE_BOOST_E = 40.0     # boost to close only with this much energy (keep some for jumps / zone)
-DROP_RANGE = 220.0       # consider every supply drop (all three) within this distance
-AMBUSH_R = (20.0, 45.0)  # ambush spot: this far from the landing point, with a view of it
+# ---- v17: stealth pathfinding ----
+# exposure.json (offline, map never changes): for every 10 m ground point, how many open-ground spots
+# within 200 m can see a mech standing there (0..81+).  A* cost per cell = 1 + EXPO_W * exposure/81,
+# so routes hug buildings instead of crossing sniper sightlines (visibility-aware path planning).
+EXPO_W = 4.0
 NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
@@ -143,6 +143,7 @@ class World:
             self._load_terrain(map_dir, w)
             self._build_nav()
             self._build_nests(random.Random(seed))
+            self._load_exposure()
         except Exception as e:
             mf.log("world init problem:", repr(e))
         mf.log(f"world: prisms={len(self.prisms)} nav={'y' if self.nav else 'n'} nests={len(self.nests)} {time.perf_counter()-t0:.2f}s")
@@ -240,6 +241,35 @@ class World:
                 if bad:
                     blocked[cy * self.navw + cx] = 1
         self.nav = blocked
+
+    def _load_exposure(self):
+        self.expo = None
+        if self.nav is None:
+            return
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "exposure.json")) as f:
+                rows = json.load(f)
+        except Exception as e:
+            mf.log("no exposure map:", repr(e))
+            return
+        pts = {}
+        for r in rows:
+            if not r[6]:                                   # ground points only (10 m grid)
+                pts[(int(round(r[0])), int(round(r[1])))] = min(r[3], 81) / 81.0
+        if not pts:
+            return
+        x0 = min(k[0] for k in pts)
+        y0 = min(k[1] for k in pts)
+        ex = [0.5] * (self.navw * self.navh)               # unknown cells: medium exposure
+        for cy in range(self.navh):
+            for cx in range(self.navw):
+                x, y = self.center((cx, cy))
+                kx = x0 + 10 * int(round((x - x0) / 10.0))
+                ky = y0 + 10 * int(round((y - y0) / 10.0))
+                v = pts.get((kx, ky))
+                if v is not None:
+                    ex[cy * self.navw + cx] = v
+        self.expo = ex
 
     def cell(self, x, y):
         cx = int(clampf((x - self.minx) / self.NAV, 0, self.navw - 1))
@@ -362,7 +392,8 @@ class Planner:
                     continue
                 if dx and dy and not (w.free((cx + dx, cy)) and w.free((cx, cy + dy))):
                     continue
-                ng = gc_ + c
+                ex_ = w.expo
+                ng = gc_ + c * (1.0 + EXPO_W * ex_[nb[1] * w.navw + nb[0]]) if ex_ is not None else gc_ + c
                 if ng < g.get(nb, 1e18):
                     g[nb] = ng
                     self.came[nb] = cur
@@ -371,7 +402,7 @@ class Planner:
 
 
 class Bot:
-    name = "survivor-v16"
+    name = "survivor-v17"
 
     def __init__(self, hello):
         seed = int(hello.get("seed", 0)) ^ (int(hello.get("slot", 0)) * 7919)
@@ -532,24 +563,6 @@ class Bot:
             if best:
                 return best
         return None
-
-    def pick_ambush(self, x, y, px, py, pz):
-        """Wall-side spot AMBUSH_R from the drop with a clear view of the ring centre; nearest to us."""
-        best, bs = None, 1e18
-        for nx_, ny_, ex in self.world.nests:
-            d = math.hypot(nx_ - px, ny_ - py)
-            if not (AMBUSH_R[0] <= d <= AMBUSH_R[1]):
-                continue
-            g = self.world.ground(nx_, ny_)
-            if not self.world.los((nx_, ny_, g + 8.0), (px, py, pz + 4.5)):
-                continue
-            sc = math.hypot(nx_ - x, ny_ - y) + 60.0 * ex        # prefer close to us and low exposure
-            if sc < bs:
-                best, bs = (nx_, ny_), sc
-        if best is None:                                       # no wall spot: 35 m out on our side
-            dx, dy = norm2(x - px, y - py)
-            best = (px + dx * 35.0, py + dy * 35.0)
-        return best
 
     def pick_nest(self, x, y, rc, rr):
         best, bs = None, 1e18
@@ -763,8 +776,7 @@ class Bot:
                     sp_ = 20.0
                     boost = me["energy"] > 30
                 else:
-                    sp_ = DUEL_CLOSE                       # v16: close in (was 140 m with a laser / 70 m without)
-                    boost = d > 50 and me["energy"] > CLOSE_BOOST_E
+                    sp_ = 140.0 if li is not None else DUEL_DIST
                 mv = self.radial_strafe(d, rate, bearing, sp_)
             if not me["in_zone"]:
                 bx, by = self.steer(x, y, z, rp[0], rp[1])
@@ -792,14 +804,14 @@ class Bot:
             self.cover = None
             mode, goal, mv, farm = self.peaceful(obs, me, x, y, z, rc, rr, inside, rp, npcs, hpr, weapons, slot_of,
                                                  t, tick, deadline, act, muzzle)
-            if mode in ("zone", "drop", "ambush-go"):
-                urgent = True
+            if mode in ("zone", "drop"):
+                urgent = urgent or mode == "zone"
             if VARIANT == "max" and mode in ("hunt", "farmgo", "cubes", "loot", "nest"):
                 urgent = True
                 boost = me["energy"] > 50 and mode == "hunt"
 
         # ---------- apply movement ----------
-        if mode in ("hold", "crate", "heal", "take", "ambush", "drop-hold") or (mv[0] == 0 and mv[1] == 0):
+        if mode in ("hold", "crate", "heal", "take") or (mv[0] == 0 and mv[1] == 0):
             move = [0.0, 0.0]
         else:
             sc_move = 1.0 if urgent else (0.75 if mode == "drop" else NOISE_FREE)
@@ -809,7 +821,7 @@ class Bot:
             act["boost"] = True
 
         spd = math.hypot(me["vel"][0], me["vel"][1])
-        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt", "chase", "farmgo", "ambush-go") and (move[0] or move[1]) and spd < 1.5:
+        if mode in ("zone", "loot", "cover", "retreat", "nest", "cubes", "drop", "rush", "hunt", "chase", "farmgo") and (move[0] or move[1]) and spd < 1.5:
             self.stuck += 1
         else:
             self.stuck = max(0, self.stuck - 2) if self.stuck < 20 else 0
@@ -928,40 +940,22 @@ class Bot:
                     act["drop"] = slot_of[cur_other]
             elif hd < 40 and math.hypot(p["pos"][0] - rc[0], p["pos"][1] - rc[1]) < rr:
                 return "loot", p["pos"], self.go_to(x, y, z, p["pos"], tick, deadline), None
-        # 2) v16 supply-drop ambush: drops are announced 25 s early and everyone converges.
-        #    falling -> wait at a wall-side spot 20-45 m away with a view of the ring, kill arrivals;
-        #    landed and quiet for 2 s -> step into the ring and capture (3 cubes, full HP and energy).
-        best_dp = None
-        for dp in obs.get("drops", []):
-            px, py = dp["pos"][0], dp["pos"][1]
-            dd = math.hypot(px - x, py - y)
-            if dd > DROP_RANGE or math.hypot(px - rc[0], py - rc[1]) > rr - 3:
-                continue
-            if dp.get("holder") not in (None, me["id"]) and dp["lands_in"] <= 0 and dp.get("progress", 0) > 2.5:
-                continue                                  # someone else is almost done: not worth it
-            if best_dp is None or dd < best_dp[1]:
-                best_dp = (dp, dd)
-        if best_dp is not None and hpr > 0.3:
-            dp, dd = best_dp
-            px, py, pz = dp["pos"]
-            near = [m for m in obs["mechs"] if m["kind"] == "mech" and math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 35]
-            if near:
-                self.drop_busy_t = t
-            quiet = t - getattr(self, "drop_busy_t", -99.0) > 2.0
-            in_ring = dd < dp["radius"] * 0.6
-            if dp["lands_in"] <= 0 and quiet:
-                if in_ring:
-                    return "drop-hold", (px, py), (0.0, 0.0), None
+        # 2) supply drop close to me and nobody near it
+        drop_ok = (t < 200 and hpr > 0.5) if VARIANT != "farm" else (hpr < 0.8 or me["cubes"] < 6)
+        drop_rng = 200 if VARIANT == "farm" else 130
+        if drop_ok:
+            for dp in obs.get("drops", []):
+                px, py = dp["pos"][0], dp["pos"][1]
+                dd = math.hypot(px - x, py - y)
+                if dd > drop_rng or math.hypot(px - rc[0], py - rc[1]) > rr:
+                    continue
+                if any(math.hypot(m["pos"][0] - px, m["pos"][1] - py) < 40 for m in obs["mechs"] if m["kind"] == "mech"):
+                    continue
+                if dd < dp["radius"] * 0.5 and dp["lands_in"] <= 0:
+                    return "hold", (px, py), (0.0, 0.0), None
+                if dd / (11.7 * 0.75) > dp["lands_in"] + 8:
+                    continue
                 return "drop", (px, py), self.go_to(x, y, z, (px, py), tick, deadline), None
-            # ambush spot (cached per drop)
-            key = dp["id"]
-            if getattr(self, "ambush_key", None) != key:
-                self.ambush_key, self.ambush_pt = key, self.pick_ambush(x, y, px, py, pz)
-            ap = self.ambush_pt
-            if ap is not None:
-                if math.hypot(ap[0] - x, ap[1] - y) > 3:
-                    return "ambush-go", ap, self.go_to(x, y, z, ap, tick, deadline), None
-                return "ambush", ap, (0.0, 0.0), None
         # 3) cubes
         if me["cubes"] < CUBE_CAP:
             cs = [c for c in obs.get("cubes", []) if math.dist(c["pos"][:2], (x, y)) < (70 if VARIANT in ("farm", "max") else 40)
@@ -1029,8 +1023,7 @@ class Bot:
         fire = [False, False]
         aim = None
         # laser: charge fully, let go only when lined up; never let the server auto-fire it
-        # v16: inside lightning range, lightning (240 dps, shorts their laser) beats starting a new charge
-        if li is not None and not (ni is not None and d <= 42 and weapons[li].get("charge", 0.0) <= 0):
+        if li is not None:
             lw = weapons[li]
             charge = lw.get("charge", 0.0)
             full = lw["stats"].get("charge", 0.75)
