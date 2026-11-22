@@ -36,11 +36,6 @@ STYLE = "hunt"
 #   "farm" : v5 + much more drones / crates / cubes / supply drops (cubes = +4% HP & dmg + upgrades)
 #   "fight": v5 + duck behind walls from charging lasers, rush laser users up close, third-party, heal breaks
 VARIANT = "fight"
-# ---- v17: stealth pathfinding ----
-# exposure.json (offline, map never changes): for every 10 m ground point, how many open-ground spots
-# within 200 m can see a mech standing there (0..81+).  A* cost per cell = 1 + EXPO_W * exposure/81,
-# so routes hug buildings instead of crossing sniper sightlines (visibility-aware path planning).
-EXPO_W = 4.0
 NEST_RANGE = 70.0 if STYLE == "hide" else 400.0
 LASER_FULL = 0.95        # release the laser only at >= 95% charge (315 dmg vs 110 at no charge)
 LASER_SAFE_HOLD = 1.6    # s after full charge before we must let go (server auto-fires at hold_s = 2.0)
@@ -143,7 +138,6 @@ class World:
             self._load_terrain(map_dir, w)
             self._build_nav()
             self._build_nests(random.Random(seed))
-            self._load_exposure()
         except Exception as e:
             mf.log("world init problem:", repr(e))
         mf.log(f"world: prisms={len(self.prisms)} nav={'y' if self.nav else 'n'} nests={len(self.nests)} {time.perf_counter()-t0:.2f}s")
@@ -241,35 +235,6 @@ class World:
                 if bad:
                     blocked[cy * self.navw + cx] = 1
         self.nav = blocked
-
-    def _load_exposure(self):
-        self.expo = None
-        if self.nav is None:
-            return
-        try:
-            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "exposure.json")) as f:
-                rows = json.load(f)
-        except Exception as e:
-            mf.log("no exposure map:", repr(e))
-            return
-        pts = {}
-        for r in rows:
-            if not r[6]:                                   # ground points only (10 m grid)
-                pts[(int(round(r[0])), int(round(r[1])))] = min(r[3], 81) / 81.0
-        if not pts:
-            return
-        x0 = min(k[0] for k in pts)
-        y0 = min(k[1] for k in pts)
-        ex = [0.5] * (self.navw * self.navh)               # unknown cells: medium exposure
-        for cy in range(self.navh):
-            for cx in range(self.navw):
-                x, y = self.center((cx, cy))
-                kx = x0 + 10 * int(round((x - x0) / 10.0))
-                ky = y0 + 10 * int(round((y - y0) / 10.0))
-                v = pts.get((kx, ky))
-                if v is not None:
-                    ex[cy * self.navw + cx] = v
-        self.expo = ex
 
     def cell(self, x, y):
         cx = int(clampf((x - self.minx) / self.NAV, 0, self.navw - 1))
@@ -392,8 +357,7 @@ class Planner:
                     continue
                 if dx and dy and not (w.free((cx + dx, cy)) and w.free((cx, cy + dy))):
                     continue
-                ex_ = w.expo
-                ng = gc_ + c * (1.0 + EXPO_W * ex_[nb[1] * w.navw + nb[0]]) if ex_ is not None else gc_ + c
+                ng = gc_ + c
                 if ng < g.get(nb, 1e18):
                     g[nb] = ng
                     self.came[nb] = cur
@@ -402,7 +366,7 @@ class Planner:
 
 
 class Bot:
-    name = "survivor-v17"
+    name = "survivor-v2"
 
     def __init__(self, hello):
         seed = int(hello.get("seed", 0)) ^ (int(hello.get("slot", 0)) * 7919)
