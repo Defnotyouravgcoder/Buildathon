@@ -1,3 +1,4 @@
+
 """Survivor bot v2 for mechfight/1  (standard library only).
 
 Placement is the score, so: stay in the safe region, stay quiet, avoid groups, duel lone hunters,
